@@ -204,6 +204,21 @@ static int ra2l1_check_errors(struct target *t)
     return ERROR_OK;
 }
 
+static int ra2l1_seq_sync(struct target *t)
+{
+    uint32_t st1;
+    /* OPST 清 0，避免残留 */
+    target_write_u8(t, REG_FCR, 0x00);
+
+    target_read_u32(t, REG_FSTATR1, &st1);
+    if (st1 & (1u << 6)) {               // FRDY 仍然=1?
+        /* 按图中虚线框：FRESETR=1 -> 0 */
+        target_write_u32(t, REG_FRESETR, 1);
+        target_write_u32(t, REG_FRESETR, 0);
+    }
+    return ERROR_OK;
+}
+
 /* Convert offset to P/E address (data flash mapped to 0xFE00_0000) */
 static inline uint32_t ra2l1_to_pe_addr(struct flash_bank *bank, uint32_t off)
 {
@@ -371,29 +386,62 @@ static int ra2l1_flash_erase(
     return r;
 }
 
-static int ra2l1_flash_write(
-    struct flash_bank *bank, const uint8_t *buf,
-    uint32_t offset, uint32_t count)
+static int ra2l1_flash_write(struct flash_bank *bank,
+                             const uint8_t *buf,
+                             uint32_t offset,
+                             uint32_t count)
 {
     struct target *t = bank->target;
     struct ra2l1_flash_bank *info = bank->driver_priv;
     if (t->state != TARGET_HALTED)
         return ERROR_TARGET_NOT_HALTED;
 
-    int r = ra2l1_enter_pe(t, info->is_data);
-    if (r) return r;
+    const uint32_t block_size = info->is_data ? 1024 : 2048;
     uint32_t addr = ra2l1_to_pe_addr(bank, offset);
     uint32_t end  = addr + count;
-    while (addr < end) {
-        unsigned chunk = info->is_data ? 1 : 4;
-        r = ra2l1_program(bank, addr, buf, chunk);
-        if (r) break;
-        addr += chunk;
-        buf  += chunk;
+    uint32_t cur_addr = addr;
+
+    while (cur_addr < end) {
+        // 计算当前 block 起始地址
+        uint32_t block_start = cur_addr & ~(block_size - 1);
+        uint32_t block_end   = block_start + block_size;
+        if (block_end > end)
+            block_end = end;
+
+        // 进入 PE 模式
+        int r = ra2l1_enter_pe(t, info->is_data);
+        if (r != ERROR_OK)
+            return r;
+
+        // 擦除当前 block
+        r = ra2l1_block_erase(bank, block_start);
+        if (r != ERROR_OK) {
+            LOG_ERROR("Block erase failed at 0x%08x", block_start);
+            ra2l1_exit_pe(t);
+            return r;
+        }
+
+        ra2l1_seq_sync(t);
+
+        // 写入 block 内的数据
+        while (cur_addr < block_end) {
+            unsigned chunk = info->is_data ? 1 : 4;
+            r = ra2l1_program(bank, cur_addr, buf, chunk);
+            if (r != ERROR_OK) {
+                LOG_ERROR("Program failed at 0x%08x", cur_addr);
+                ra2l1_exit_pe(t);
+                return r;
+            }
+            cur_addr += chunk;
+            buf      += chunk;
+        }
+
+        ra2l1_exit_pe(t);
     }
-    ra2l1_exit_pe(t);
-    return r;
+
+    return ERROR_OK;
 }
+
 
 static int ra2l1_flash_read(
     struct flash_bank *bank, uint8_t *buf,
