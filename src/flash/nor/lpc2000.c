@@ -28,6 +28,9 @@
 #include <target/arm_opcodes.h>
 #include <target/armv7m.h>
 
+#include <inttypes.h>
+#include <ctype.h>
+
 /**
  * @file
  * flash programming support for NXP LPC8xx,LPC1xxx,LPC4xxx,LP5410x,LPC2xxx and NHS31xx devices.
@@ -212,6 +215,13 @@
 #define LPC1345        0x28010541
 #define LPC1346        0x08018542
 #define LPC1347        0x08020543
+
+#define LPC1517        0x00001517
+#define LPC1518        0x00001518
+#define LPC1519        0x00001519
+#define LPC1547        0x00001547
+#define LPC1548        0x00001548
+#define LPC1549        0x00001549
 
 #define LPC1751_1      0x25001110
 #define LPC1751_2      0x25001118
@@ -719,137 +729,175 @@ static int lpc2000_iap_working_area_init(struct flash_bank *bank, struct working
 /* call LPC8xx/LPC1xxx/LPC4xxx/LPC5410x/LPC2000 IAP function */
 
 static int lpc2000_iap_call(struct flash_bank *bank, struct working_area *iap_working_area, int code,
-		uint32_t param_table[5], uint32_t result_table[4])
+                            uint32_t param_table[5], uint32_t result_table[4])
 {
-	struct lpc2000_flash_bank *lpc2000_info = bank->driver_priv;
-	struct target *target = bank->target;
+    struct lpc2000_flash_bank *lpc2000_info = bank->driver_priv;
+    struct target *target = bank->target;
 
-	struct arm_algorithm arm_algo;	/* for LPC2000 */
-	struct armv7m_algorithm armv7m_info;	/* for LPC8xx/LPC1xxx/LPC4xxx/LPC5410x */
-	uint32_t iap_entry_point = 0;	/* to make compiler happier */
+    struct arm_algorithm     arm_algo;      /* LPC2000 (ARM) */
+    struct armv7m_algorithm  armv7m_info;   /* Cortex-M 家族 */
+    uint32_t iap_entry_point = 0;
 
-	switch (lpc2000_info->variant) {
-		case LPC800:
-		case LPC1100:
-		case LPC1700:
-		case LPC_AUTO:
-			armv7m_info.common_magic = ARMV7M_COMMON_MAGIC;
-			armv7m_info.core_mode = ARM_MODE_THREAD;
-			iap_entry_point = 0x1fff1ff1;
-			break;
-		case LPC1500:
-		case LPC54100:
-			armv7m_info.common_magic = ARMV7M_COMMON_MAGIC;
-			armv7m_info.core_mode = ARM_MODE_THREAD;
-			iap_entry_point = 0x03000205;
-			break;
-		case LPC2000_V1:
-		case LPC2000_V2:
-			arm_algo.common_magic = ARM_COMMON_MAGIC;
-			arm_algo.core_mode = ARM_MODE_SVC;
-			arm_algo.core_state = ARM_STATE_ARM;
-			iap_entry_point = 0x7ffffff1;
-			break;
-		case LPC4300:
-			armv7m_info.common_magic = ARMV7M_COMMON_MAGIC;
-			armv7m_info.core_mode = ARM_MODE_THREAD;
-			/* read out IAP entry point from ROM driver table at 0x10400100 */
-			target_read_u32(target, 0x10400100, &iap_entry_point);
-			break;
-		default:
-			LOG_ERROR("BUG: unknown lpc2000->variant encountered");
-			exit(-1);
-	}
+    switch (lpc2000_info->variant) {
+    case LPC800:
+    case LPC1100:
+    case LPC1700:
+    case LPC_AUTO:
+        armv7m_info.common_magic = ARMV7M_COMMON_MAGIC;
+        armv7m_info.core_mode    = ARM_MODE_THREAD;
+        iap_entry_point = 0x1fff1ff1; /* Thumb-bit set */
+        break;
+    case LPC1500:
+    case LPC54100:
+        armv7m_info.common_magic = ARMV7M_COMMON_MAGIC;
+        armv7m_info.core_mode    = ARM_MODE_THREAD;
+        iap_entry_point = 0x03000205; /* Thumb-bit set(LPC15xx ROM IAP) */
+        break;
+    case LPC2000_V1:
+    case LPC2000_V2:
+        arm_algo.common_magic = ARM_COMMON_MAGIC;
+        arm_algo.core_mode    = ARM_MODE_SVC;
+        arm_algo.core_state   = ARM_STATE_ARM;
+        iap_entry_point = 0x7ffffff1;
+        break;
+    case LPC4300:
+        armv7m_info.common_magic = ARMV7M_COMMON_MAGIC;
+        armv7m_info.core_mode    = ARM_MODE_THREAD;
+        target_read_u32(target, 0x10400100, &iap_entry_point);
+        break;
+    default:
+        LOG_ERROR("BUG: unknown lpc2000->variant encountered");
+        exit(-1);
+    }
 
-	if (lpc2000_info->iap_entry_alternative != 0x0)
-		iap_entry_point = lpc2000_info->iap_entry_alternative;
+    if (lpc2000_info->iap_entry_alternative != 0x0)
+        iap_entry_point = lpc2000_info->iap_entry_alternative;
 
-	struct mem_param mem_params[2];
+    /* Cortex-M:确保 Thumb 位 */
+    if (lpc2000_info->variant != LPC2000_V1 && lpc2000_info->variant != LPC2000_V2) {
+        if ((iap_entry_point & 1u) == 0) {
+            LOG_WARNING("IAP entry 0x%08" PRIx32 " not thumb-encoded, forcing LSB=1", iap_entry_point);
+            iap_entry_point |= 1u;
+        }
+    }
 
-	/* command parameter table */
-	init_mem_param(&mem_params[0], iap_working_area->address + 8, 6 * 4, PARAM_OUT);
-	target_buffer_set_u32(target, mem_params[0].value, code);
-	target_buffer_set_u32(target, mem_params[0].value + 0x04, param_table[0]);
-	target_buffer_set_u32(target, mem_params[0].value + 0x08, param_table[1]);
-	target_buffer_set_u32(target, mem_params[0].value + 0x0c, param_table[2]);
-	target_buffer_set_u32(target, mem_params[0].value + 0x10, param_table[3]);
-	target_buffer_set_u32(target, mem_params[0].value + 0x14, param_table[4]);
+    /* mem_params:wa+0x08 放 cmd/params,wa+0x20 放 results */
+    struct mem_param mem_params[2];
+    init_mem_param(&mem_params[0], iap_working_area->address + 0x08, 6 * 4, PARAM_OUT);
+    target_buffer_set_u32(target, mem_params[0].value + 0x00, (uint32_t)code);
+    target_buffer_set_u32(target, mem_params[0].value + 0x04, param_table[0]);
+    target_buffer_set_u32(target, mem_params[0].value + 0x08, param_table[1]);
+    target_buffer_set_u32(target, mem_params[0].value + 0x0C, param_table[2]);
+    target_buffer_set_u32(target, mem_params[0].value + 0x10, param_table[3]);
+    target_buffer_set_u32(target, mem_params[0].value + 0x14, param_table[4]);
 
-	struct reg_param reg_params[5];
+    init_mem_param(&mem_params[1], iap_working_area->address + 0x20, 5 * 4, PARAM_IN);
 
-	init_reg_param(&reg_params[0], "r0", 32, PARAM_OUT);
-	buf_set_u32(reg_params[0].value, 0, 32, iap_working_area->address + 0x08);
+    /* reg_params:r0=params,r1=results,r12=entry,sp/lr 由族决定 */
+    struct reg_param reg_params[5];
+    init_reg_param(&reg_params[0], "r0",  32, PARAM_OUT);
+    buf_set_u32(reg_params[0].value, 0, 32, (uint32_t)(iap_working_area->address + 0x08));
 
-	/* command result table */
-	init_mem_param(&mem_params[1], iap_working_area->address + 0x20, 5 * 4, PARAM_IN);
+    init_reg_param(&reg_params[1], "r1",  32, PARAM_OUT);
+    buf_set_u32(reg_params[1].value, 0, 32, (uint32_t)(iap_working_area->address + 0x20));
 
-	init_reg_param(&reg_params[1], "r1", 32, PARAM_OUT);
-	buf_set_u32(reg_params[1].value, 0, 32, iap_working_area->address + 0x20);
+    init_reg_param(&reg_params[2], "r12", 32, PARAM_OUT);
+    buf_set_u32(reg_params[2].value, 0, 32, iap_entry_point);
 
-	/* IAP entry point */
-	init_reg_param(&reg_params[2], "r12", 32, PARAM_OUT);
-	buf_set_u32(reg_params[2].value, 0, 32, iap_entry_point);
+    int run_ret = ERROR_OK;
 
-	switch (lpc2000_info->variant) {
-		case LPC800:
-		case LPC1100:
-		case LPC1500:
-		case LPC1700:
-		case LPC4300:
-		case LPC54100:
-		case LPC_AUTO:
-			/* IAP stack */
-			init_reg_param(&reg_params[3], "sp", 32, PARAM_OUT);
-			buf_set_u32(reg_params[3].value, 0, 32,
-				iap_working_area->address + IAP_CODE_LEN + lpc2000_info->iap_max_stack);
+    switch (lpc2000_info->variant) {
+    case LPC800:
+    case LPC1100:
+    case LPC1500:
+    case LPC1700:
+    case LPC4300:
+    case LPC54100:
+    case LPC_AUTO: {
+        init_reg_param(&reg_params[3], "sp", 32, PARAM_OUT);
+        buf_set_u32(reg_params[3].value, 0, 32,
+            (uint32_t)(iap_working_area->address + IAP_CODE_LEN + lpc2000_info->iap_max_stack));
 
-			/* return address */
-			init_reg_param(&reg_params[4], "lr", 32, PARAM_OUT);
-			buf_set_u32(reg_params[4].value, 0, 32, (iap_working_area->address + 0x04) | 1);
-			/* bit0 of LR = 1 to return in Thumb mode */
+        init_reg_param(&reg_params[4], "lr", 32, PARAM_OUT);
+        buf_set_u32(reg_params[4].value, 0, 32,
+            (uint32_t)((iap_working_area->address + 0x04) | 1u)); /* Thumb return */
 
-			target_run_algorithm(target, 2, mem_params, 5, reg_params, iap_working_area->address, 0, 10000,
-					&armv7m_info);
-			break;
-		case LPC2000_V1:
-		case LPC2000_V2:
-			/* IAP stack */
-			init_reg_param(&reg_params[3], "sp_svc", 32, PARAM_OUT);
-			buf_set_u32(reg_params[3].value, 0, 32,
-				iap_working_area->address + IAP_CODE_LEN + lpc2000_info->iap_max_stack);
+        /* 抓 WA 头 64B(可选) */
+        uint8_t pre[64] = {0}, post[64] = {0};
+        target_read_buffer(target, iap_working_area->address, sizeof(pre), pre);
+        LOG_INFO("WA[pre,64]: %02x %02x %02x %02x  %02x %02x %02x %02x ...",
+                 pre[0],pre[1],pre[2],pre[3],pre[4],pre[5],pre[6],pre[7]);
 
-			/* return address */
-			init_reg_param(&reg_params[4], "lr_svc", 32, PARAM_OUT);
-			buf_set_u32(reg_params[4].value, 0, 32, iap_working_area->address + 0x04);
+        run_ret = target_run_algorithm(target,
+                                       2, mem_params,
+                                       5, reg_params,
+                                       iap_working_area->address, /* stub entry */
+                                       0,
+                                       10000,
+                                       &armv7m_info);
 
-			target_run_algorithm(target, 2, mem_params, 5, reg_params, iap_working_area->address,
-					iap_working_area->address + 0x4, 10000, &arm_algo);
-			break;
-		default:
-			LOG_ERROR("BUG: unknown lpc2000->variant encountered");
-			exit(-1);
-	}
+        target_read_buffer(target, iap_working_area->address, sizeof(post), post);
+        LOG_INFO("WA[post,64]: %02x %02x %02x %02x  %02x %02x %02x %02x ...",
+                 post[0],post[1],post[2],post[3],post[4],post[5],post[6],post[7]);
+        break;
+    }
+    case LPC2000_V1:
+    case LPC2000_V2:
+        init_reg_param(&reg_params[3], "sp_svc", 32, PARAM_OUT);
+        buf_set_u32(reg_params[3].value, 0, 32,
+            (uint32_t)(iap_working_area->address + IAP_CODE_LEN + lpc2000_info->iap_max_stack));
 
-	int status_code = target_buffer_get_u32(target, mem_params[1].value);
-	result_table[0] = target_buffer_get_u32(target, mem_params[1].value + 0x04);
-	result_table[1] = target_buffer_get_u32(target, mem_params[1].value + 0x08);
-	result_table[2] = target_buffer_get_u32(target, mem_params[1].value + 0x0c);
-	result_table[3] = target_buffer_get_u32(target, mem_params[1].value + 0x10);
+        init_reg_param(&reg_params[4], "lr_svc", 32, PARAM_OUT);
+        buf_set_u32(reg_params[4].value, 0, 32, (uint32_t)(iap_working_area->address + 0x04));
 
-	LOG_DEBUG("IAP command = %i (0x%8.8" PRIx32 ", 0x%8.8" PRIx32 ", 0x%8.8" PRIx32 ", 0x%8.8" PRIx32 ", 0x%8.8" PRIx32
-			") completed with result = %8.8x",
-			code, param_table[0], param_table[1], param_table[2], param_table[3], param_table[4], status_code);
+        run_ret = target_run_algorithm(target,
+                                       2, mem_params,
+                                       5, reg_params,
+                                       iap_working_area->address,
+                                       iap_working_area->address + 0x4,
+                                       10000, &arm_algo);
+        break;
+    default:
+        LOG_ERROR("BUG: unknown lpc2000->variant encountered");
+        exit(-1);
+    }
 
-	destroy_mem_param(&mem_params[0]);
-	destroy_mem_param(&mem_params[1]);
+    /* 核心改动:算法若失败,直接返回,不去读未被回填的 host buffer */
+    if (run_ret != ERROR_OK) {
+        LOG_WARNING("IAP run failed/timeout: %d", run_ret);
+        /* 清理寄存器/内存参数 */
+        destroy_mem_param(&mem_params[0]);
+        destroy_mem_param(&mem_params[1]);
+        destroy_reg_param(&reg_params[0]);
+        destroy_reg_param(&reg_params[1]);
+        destroy_reg_param(&reg_params[2]);
+        destroy_reg_param(&reg_params[3]);
+        destroy_reg_param(&reg_params[4]);
+        return ERROR_FAIL;
+    }
 
-	destroy_reg_param(&reg_params[0]);
-	destroy_reg_param(&reg_params[1]);
-	destroy_reg_param(&reg_params[2]);
-	destroy_reg_param(&reg_params[3]);
-	destroy_reg_param(&reg_params[4]);
+    /* 读取返回:手册 15xx 的 #54 把 PartID 放在 Result0(下面仍按通用表格读取) */
+    int status_code = (int)target_buffer_get_u32(target, mem_params[1].value + 0x00);
+    result_table[0] = target_buffer_get_u32(target, mem_params[1].value + 0x04);
+    result_table[1] = target_buffer_get_u32(target, mem_params[1].value + 0x08);
+    result_table[2] = target_buffer_get_u32(target, mem_params[1].value + 0x0C);
+    result_table[3] = target_buffer_get_u32(target, mem_params[1].value + 0x10);
 
-	return status_code;
+    LOG_DEBUG("IAP cmd=%d (params=%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32
+              ") -> status=%08x res=[%08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 "]",
+              code, param_table[0], param_table[1], param_table[2], param_table[3], param_table[4],
+              status_code, result_table[0], result_table[1], result_table[2], result_table[3]);
+
+    destroy_mem_param(&mem_params[0]);
+    destroy_mem_param(&mem_params[1]);
+    destroy_reg_param(&reg_params[0]);
+    destroy_reg_param(&reg_params[1]);
+    destroy_reg_param(&reg_params[2]);
+    destroy_reg_param(&reg_params[3]);
+    destroy_reg_param(&reg_params[4]);
+
+    /* 注意:对 LPC15xx 的 #54,status_code 可能"看起来古怪",上层会忽略它 */
+    return ERROR_OK;
 }
 
 static int lpc2000_iap_blank_check(struct flash_bank *bank, unsigned int first,
@@ -1218,35 +1266,111 @@ static int lpc2000_write(struct flash_bank *bank, const uint8_t *buffer, uint32_
 	return retval;
 }
 
+static int ascii_like32(uint32_t w)
+{
+    /* 判定 32bit 是否像可打印 ASCII：非 0 的字节都在 0x20~0x7E */
+    int printable = 0, bytes = 0;
+    for (int s = 0; s < 32; s += 8) {
+        uint8_t c = (uint8_t)((w >> s) & 0xFF);
+        if (c == 0) continue;
+        bytes++;
+        if (c >= 0x20 && c <= 0x7E) printable++;
+    }
+    return (bytes > 0) && (printable == bytes);
+}
+
+// 有时候没办法,就回退读也成.
 static int get_lpc2000_part_id(struct flash_bank *bank, uint32_t *part_id)
 {
-	if (bank->target->state != TARGET_HALTED) {
-		LOG_ERROR("Target not halted");
-		return ERROR_TARGET_NOT_HALTED;
-	}
+    if (bank->target->state != TARGET_HALTED) {
+        LOG_ERROR("Target not halted");
+        return ERROR_TARGET_NOT_HALTED;
+    }
 
-	uint32_t param_table[5] = {0};
-	uint32_t result_table[4];
-	struct working_area *iap_working_area;
+    uint32_t param_table[5]  = {0, 0, 0, 0, 0};
+    uint32_t result_table[4] = {0xA5A5A5A5u, 0xA5A5A5A5u, 0xA5A5A5A5u, 0xA5A5A5A5u};
 
-	int retval = lpc2000_iap_working_area_init(bank, &iap_working_area);
+    struct working_area *iap_working_area = NULL;
+    int ret = lpc2000_iap_working_area_init(bank, &iap_working_area);
+    if (ret != ERROR_OK) {
+        LOG_ERROR("IAP workarea init failed: %d", ret);
+        return ret;
+    }
 
-	if (retval != ERROR_OK)
-		return retval;
+    uint32_t wa_addr = (uint32_t)iap_working_area->address;
+    uint32_t wa_size = (uint32_t)iap_working_area->size;
+    LOG_INFO("LPC IAP(part-id): workarea @0x%08" PRIx32 " size=%" PRIu32, wa_addr, wa_size);
+    LOG_INFO("LPC IAP(part-id): cmd=54 params=[%08" PRIx32 " %08" PRIx32 " %08" PRIx32
+             " %08" PRIx32 " %08" PRIx32 "]",
+             param_table[0], param_table[1], param_table[2], param_table[3], param_table[4]);
 
-	/* The status seems to be bogus with the part ID command on some IAP
-	   firmwares, so ignore it. */
-	lpc2000_iap_call(bank, iap_working_area, 54, param_table, result_table);
+    /* 54 = Read Part Identification Number(手册:Result0 = Part ID) */
+    ret = lpc2000_iap_call(bank, iap_working_area, 54, param_table, result_table);
 
-	struct target *target = bank->target;
-	target_free_working_area(target, iap_working_area);
+    struct target *target = bank->target;
+    target_free_working_area(target, iap_working_area);
 
-	/* If the result is zero, the command probably didn't work out. */
-	if (result_table[0] == 0)
-		return LPC2000_INVALID_COMMAND;
+    /* 打印 IAP 返回表,同时以 ASCII 便于肉眼识别脏数据 */
+    char a0[5] = {0}, a1[5] = {0}, a2[5] = {0}, a3[5] = {0};
+    uint32_t w;
+    w = result_table[0]; a0[0]=isprint((int)(w&0xFF))?(char)(w&0xFF):'.';
+    a0[1]=isprint((int)((w>>8)&0xFF))?(char)((w>>8)&0xFF):'.';
+    a0[2]=isprint((int)((w>>16)&0xFF))?(char)((w>>16)&0xFF):'.';
+    a0[3]=isprint((int)((w>>24)&0xFF))?(char)((w>>24)&0xFF):'.';
+    w = result_table[1]; a1[0]=isprint((int)(w&0xFF))?(char)(w&0xFF):'.';
+    a1[1]=isprint((int)((w>>8)&0xFF))?(char)((w>>8)&0xFF):'.';
+    a1[2]=isprint((int)((w>>16)&0xFF))?(char)((w>>16)&0xFF):'.';
+    a1[3]=isprint((int)((w>>24)&0xFF))?(char)((w>>24)&0xFF):'.';
+    w = result_table[2]; a2[0]=isprint((int)(w&0xFF))?(char)(w&0xFF):'.';
+    a2[1]=isprint((int)((w>>8)&0xFF))?(char)((w>>8)&0xFF):'.';
+    a2[2]=isprint((int)((w>>16)&0xFF))?(char)((w>>16)&0xFF):'.';
+    a2[3]=isprint((int)((w>>24)&0xFF))?(char)((w>>24)&0xFF):'.';
+    w = result_table[3]; a3[0]=isprint((int)(w&0xFF))?(char)(w&0xFF):'.';
+    a3[1]=isprint((int)((w>>8)&0xFF))?(char)((w>>8)&0xFF):'.';
+    a3[2]=isprint((int)((w>>16)&0xFF))?(char)((w>>16)&0xFF):'.';
+    a3[3]=isprint((int)((w>>24)&0xFF))?(char)((w>>24)&0xFF):'.';
 
-	*part_id = result_table[0];
-	return LPC2000_CMD_SUCCESS;
+    LOG_INFO("LPC IAP(part-id): result=[%08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32
+             "]  ascii=['%s' '%s' '%s' '%s']",
+             result_table[0], result_table[1], result_table[2], result_table[3], a0, a1, a2, a3);
+
+    /* 参考寄存器读(你已验证稳定) */
+    uint32_t dev_id = 0, rom_rev = 0;
+    int rr1 = target_read_u32(target, 0x400743F8, &dev_id);
+    int rr2 = target_read_u32(target, 0x400743FC, &rom_rev);
+    if (rr1 == ERROR_OK && rr2 == ERROR_OK) {
+        LOG_INFO("SYSCON: DEVICE_ID=0x%08" PRIx32 " ROMREV=0x%08" PRIx32, dev_id, rom_rev);
+    } else {
+        LOG_WARNING("SYSCON: read DEVICE_ID/ROMREV failed (r1=%d r2=%d)", rr1, rr2);
+    }
+
+    /* 若 IAP 调用失败(算法没跑完或没回填),直接回退寄存器 */
+    if (ret != ERROR_OK) {
+        LOG_WARNING("IAP call failed (ret=%d), fallback to SYSCON DEVICE_ID", ret);
+        if (rr1 == ERROR_OK) {
+            *part_id = dev_id;
+            LOG_INFO("PartID(final,fallback)=0x%08" PRIx32, *part_id);
+            return LPC2000_CMD_SUCCESS;
+        }
+        return LPC2000_INVALID_COMMAND;
+    }
+
+    /* 按手册:Result0 = Part ID */
+    uint32_t pid = result_table[0];
+
+    /* 合法性兜底;若看起来像 ASCII/0xFFFFFFFF,再回退寄存器 */
+    if (pid == 0 || pid == 0xFFFFFFFFu || ascii_like32(pid)) {
+        LOG_WARNING("IAP Result0 looks suspicious (0x%08" PRIx32 "), fallback to SYSCON DEVICE_ID", pid);
+        if (rr1 == ERROR_OK) {
+            pid = dev_id;
+        } else {
+            return LPC2000_INVALID_COMMAND;
+        }
+    }
+
+    *part_id = pid;
+    LOG_INFO("PartID(final)=0x%08" PRIx32, *part_id);
+    return LPC2000_CMD_SUCCESS;
 }
 
 static int lpc2000_auto_probe_flash(struct flash_bank *bank)
@@ -1350,6 +1474,22 @@ static int lpc2000_auto_probe_flash(struct flash_bank *bank)
 		case LPC1345:
 			lpc2000_info->variant = LPC1100;
 			bank->size = 32 * 1024;
+			break;
+
+		case LPC1517:
+		case LPC1547:
+			lpc2000_info->variant = LPC1500;
+			bank->size = 64 * 1024;
+			break;
+		case LPC1518:
+		case LPC1548:
+			lpc2000_info->variant = LPC1500;
+			bank->size = 128 * 1024;
+			break;
+		case LPC1519:
+		case LPC1549:
+			lpc2000_info->variant = LPC1500;
+			bank->size = 256 * 1024;
 			break;
 
 		case LPC1751_1:
