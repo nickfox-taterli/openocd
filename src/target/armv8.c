@@ -18,6 +18,7 @@
 
 #include "register.h"
 #include <helper/binarybuffer.h>
+#include <helper/string_choices.h>
 #include <helper/command.h>
 #include <helper/nvp.h>
 
@@ -1302,7 +1303,7 @@ COMMAND_HANDLER(armv8_pauth_command)
 int armv8_handle_cache_info_command(struct command_invocation *cmd,
 	struct armv8_cache_common *armv8_cache)
 {
-	if (armv8_cache->info == -1) {
+	if (!armv8_cache->info_valid) {
 		command_print(cmd, "cache not yet identified");
 		return ERROR_OK;
 	}
@@ -1329,7 +1330,7 @@ int armv8_init_arch_info(struct target *target, struct armv8_common *armv8)
 	armv8->common_magic = ARMV8_COMMON_MAGIC;
 
 	armv8->armv8_mmu.armv8_cache.l2_cache = NULL;
-	armv8->armv8_mmu.armv8_cache.info = -1;
+	armv8->armv8_mmu.armv8_cache.info_valid = false;
 	armv8->armv8_mmu.armv8_cache.flush_all_data_cache = NULL;
 	armv8->armv8_mmu.armv8_cache.display_cache_info = NULL;
 	return ERROR_OK;
@@ -1359,10 +1360,6 @@ static int armv8_aarch64_state(struct target *target)
 
 int armv8_arch_state(struct target *target)
 {
-	static const char * const state[] = {
-		"disabled", "enabled"
-	};
-
 	struct armv8_common *armv8 = target_to_armv8(target);
 	struct arm *arm = &armv8->arm;
 
@@ -1377,9 +1374,9 @@ int armv8_arch_state(struct target *target)
 		arm_arch_state(target);
 
 	LOG_USER("MMU: %s, D-Cache: %s, I-Cache: %s",
-		state[armv8->armv8_mmu.mmu_enabled],
-		state[armv8->armv8_mmu.armv8_cache.d_u_cache_enabled],
-		state[armv8->armv8_mmu.armv8_cache.i_cache_enabled]);
+		str_enabled_disabled(armv8->armv8_mmu.mmu_enabled),
+		str_enabled_disabled(armv8->armv8_mmu.armv8_cache.d_u_cache_enabled),
+		str_enabled_disabled(armv8->armv8_mmu.armv8_cache.i_cache_enabled));
 
 	if (arm->core_mode == ARM_MODE_ABT)
 		armv8_show_fault_registers(target);

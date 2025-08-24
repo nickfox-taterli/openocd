@@ -650,9 +650,9 @@ static int identity_virt2phys(struct target *target,
 	return ERROR_OK;
 }
 
-static int no_mmu(struct target *target, int *enabled)
+static int no_mmu(struct target *target, bool *enabled)
 {
-	*enabled = 0;
+	*enabled = false;
 	return ERROR_OK;
 }
 
@@ -1978,7 +1978,7 @@ int target_alloc_working_area_try(struct target *target, uint32_t size, struct w
 	/* Reevaluate working area address based on MMU state*/
 	if (!target->working_areas) {
 		int retval;
-		int enabled;
+		bool enabled;
 
 		retval = target->type->mmu(target, &enabled);
 		if (retval != ERROR_OK)
@@ -2544,7 +2544,7 @@ int target_read_u64(struct target *target, target_addr_t address, uint64_t *valu
 
 	if (retval == ERROR_OK) {
 		*value = target_buffer_get_u64(target, value_buf);
-		LOG_DEBUG("address: " TARGET_ADDR_FMT ", value: 0x%16.16" PRIx64 "",
+		LOG_DEBUG("address: " TARGET_ADDR_FMT ", value: 0x%16.16" PRIx64,
 				  address,
 				  *value);
 	} else {
@@ -2568,7 +2568,7 @@ int target_read_u32(struct target *target, target_addr_t address, uint32_t *valu
 
 	if (retval == ERROR_OK) {
 		*value = target_buffer_get_u32(target, value_buf);
-		LOG_DEBUG("address: " TARGET_ADDR_FMT ", value: 0x%8.8" PRIx32 "",
+		LOG_DEBUG("address: " TARGET_ADDR_FMT ", value: 0x%8.8" PRIx32,
 				  address,
 				  *value);
 	} else {
@@ -2635,7 +2635,7 @@ int target_write_u64(struct target *target, target_addr_t address, uint64_t valu
 		return ERROR_FAIL;
 	}
 
-	LOG_DEBUG("address: " TARGET_ADDR_FMT ", value: 0x%16.16" PRIx64 "",
+	LOG_DEBUG("address: " TARGET_ADDR_FMT ", value: 0x%16.16" PRIx64,
 			  address,
 			  value);
 
@@ -2656,7 +2656,7 @@ int target_write_u32(struct target *target, target_addr_t address, uint32_t valu
 		return ERROR_FAIL;
 	}
 
-	LOG_DEBUG("address: " TARGET_ADDR_FMT ", value: 0x%8.8" PRIx32 "",
+	LOG_DEBUG("address: " TARGET_ADDR_FMT ", value: 0x%8.8" PRIx32,
 			  address,
 			  value);
 
@@ -2716,7 +2716,7 @@ int target_write_phys_u64(struct target *target, target_addr_t address, uint64_t
 		return ERROR_FAIL;
 	}
 
-	LOG_DEBUG("address: " TARGET_ADDR_FMT ", value: 0x%16.16" PRIx64 "",
+	LOG_DEBUG("address: " TARGET_ADDR_FMT ", value: 0x%16.16" PRIx64,
 			  address,
 			  value);
 
@@ -2737,7 +2737,7 @@ int target_write_phys_u32(struct target *target, target_addr_t address, uint32_t
 		return ERROR_FAIL;
 	}
 
-	LOG_DEBUG("address: " TARGET_ADDR_FMT ", value: 0x%8.8" PRIx32 "",
+	LOG_DEBUG("address: " TARGET_ADDR_FMT ", value: 0x%8.8" PRIx32,
 			  address,
 			  value);
 
@@ -3216,8 +3216,6 @@ COMMAND_HANDLER(handle_wait_halt_command)
 /* wait for target state to change. The trick here is to have a low
  * latency for short waits and not to suck up all the CPU time
  * on longer waits.
- *
- * After 500ms, keep_alive() is invoked
  */
 int target_wait_state(struct target *target, enum target_state state, unsigned int ms)
 {
@@ -3239,11 +3237,9 @@ int target_wait_state(struct target *target, enum target_state state, unsigned i
 				nvp_value2name(nvp_target_state, state)->name);
 		}
 
-		if (cur - then > 500) {
-			keep_alive();
-			if (openocd_is_shutdown_pending())
-				return ERROR_SERVER_INTERRUPTED;
-		}
+		keep_alive();
+		if (openocd_is_shutdown_pending())
+			return ERROR_SERVER_INTERRUPTED;
 
 		if ((cur-then) > ms) {
 			LOG_ERROR("timed out while waiting for target %s",
@@ -3977,7 +3973,7 @@ static int handle_bp_command_set(struct command_invocation *cmd,
 		retval = context_breakpoint_add(target, asid, length, hw);
 		/* error is always logged in context_breakpoint_add(), do not print it again */
 		if (retval == ERROR_OK)
-			command_print(cmd, "Context breakpoint set at 0x%8.8" PRIx32 "", asid);
+			command_print(cmd, "Context breakpoint set at 0x%8.8" PRIx32, asid);
 
 	} else {
 		if (!target->type->add_hybrid_breakpoint) {
@@ -3987,7 +3983,7 @@ static int handle_bp_command_set(struct command_invocation *cmd,
 		retval = hybrid_breakpoint_add(target, addr, asid, length, hw);
 		/* error is always logged in hybrid_breakpoint_add(), do not print it again */
 		if (retval == ERROR_OK)
-			command_print(cmd, "Hybrid breakpoint set at 0x%8.8" PRIx32 "", asid);
+			command_print(cmd, "Hybrid breakpoint set at 0x%8.8" PRIx32, asid);
 	}
 	return retval;
 }
@@ -4667,11 +4663,18 @@ COMMAND_HANDLER(handle_target_write_memory)
  */
 void target_handle_event(struct target *target, enum target_event e)
 {
-	struct target_event_action *teap;
+	struct target_event_action *teap, *tmp;
 	int retval;
 
-	list_for_each_entry(teap, &target->events_action, list) {
+	list_for_each_entry_safe(teap, tmp, &target->events_action, list) {
 		if (teap->event == e) {
+			/*
+			 * The event can be destroyed by its own handler.
+			 * Make a local copy and use it in place of the original.
+			 */
+			struct target_event_action local_teap = *teap;
+			teap = &local_teap;
+
 			LOG_DEBUG("target: %s (%s) event: %d (%s) action: %s",
 					   target_name(target),
 					   target_type_name(target),
@@ -4687,7 +4690,13 @@ void target_handle_event(struct target *target, enum target_event e)
 			struct target *saved_target_override = cmd_ctx->current_target_override;
 			cmd_ctx->current_target_override = target;
 
+			/*
+			 * The event can be destroyed by its own handler.
+			 * Prevent the body to get deallocated by Jim.
+			 */
+			Jim_IncrRefCount(teap->body);
 			retval = Jim_EvalObj(teap->interp, teap->body);
+			Jim_DecrRefCount(teap->interp, teap->body);
 
 			cmd_ctx->current_target_override = saved_target_override;
 

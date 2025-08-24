@@ -68,8 +68,8 @@ static int cortex_a_unset_breakpoint(struct target *target,
 	struct breakpoint *breakpoint);
 static int cortex_a_wait_dscr_bits(struct target *target, uint32_t mask,
 	uint32_t value, uint32_t *dscr);
-static int cortex_a_mmu(struct target *target, int *enabled);
-static int cortex_a_mmu_modify(struct target *target, int enable);
+static int cortex_a_mmu(struct target *target, bool *enabled);
+static int cortex_a_mmu_modify(struct target *target, bool enable);
 static int cortex_a_virt2phys(struct target *target,
 	target_addr_t virt, target_addr_t *phys);
 static int cortex_a_read_cpu_memory(struct target *target,
@@ -109,17 +109,17 @@ static int cortex_a_restore_cp15_control_reg(struct target *target)
  * If !phys_access, switch to SVC mode and make sure MMU is on
  * If phys_access, switch off mmu
  */
-static int cortex_a_prep_memaccess(struct target *target, int phys_access)
+static int cortex_a_prep_memaccess(struct target *target, bool phys_access)
 {
 	struct armv7a_common *armv7a = target_to_armv7a(target);
 	struct cortex_a_common *cortex_a = target_to_cortex_a(target);
-	int mmu_enabled = 0;
+	bool mmu_enabled = false;
 
-	if (phys_access == 0) {
+	if (!phys_access) {
 		arm_dpm_modeswitch(&armv7a->dpm, ARM_MODE_SVC);
 		cortex_a_mmu(target, &mmu_enabled);
 		if (mmu_enabled)
-			cortex_a_mmu_modify(target, 1);
+			cortex_a_mmu_modify(target, true);
 		if (cortex_a->dacrfixup_mode == CORTEX_A_DACRFIXUP_ON) {
 			/* overwrite DACR to all-manager */
 			armv7a->arm.mcr(target, 15,
@@ -129,7 +129,7 @@ static int cortex_a_prep_memaccess(struct target *target, int phys_access)
 	} else {
 		cortex_a_mmu(target, &mmu_enabled);
 		if (mmu_enabled)
-			cortex_a_mmu_modify(target, 0);
+			cortex_a_mmu_modify(target, false);
 	}
 	return ERROR_OK;
 }
@@ -139,12 +139,12 @@ static int cortex_a_prep_memaccess(struct target *target, int phys_access)
  * If !phys_access, switch to previous mode
  * If phys_access, restore MMU setting
  */
-static int cortex_a_post_memaccess(struct target *target, int phys_access)
+static int cortex_a_post_memaccess(struct target *target, bool phys_access)
 {
 	struct armv7a_common *armv7a = target_to_armv7a(target);
 	struct cortex_a_common *cortex_a = target_to_cortex_a(target);
 
-	if (phys_access == 0) {
+	if (!phys_access) {
 		if (cortex_a->dacrfixup_mode == CORTEX_A_DACRFIXUP_ON) {
 			/* restore */
 			armv7a->arm.mcr(target, 15,
@@ -153,10 +153,10 @@ static int cortex_a_post_memaccess(struct target *target, int phys_access)
 		}
 		arm_dpm_modeswitch(&armv7a->dpm, ARM_MODE_ANY);
 	} else {
-		int mmu_enabled = 0;
+		bool mmu_enabled = false;
 		cortex_a_mmu(target, &mmu_enabled);
 		if (mmu_enabled)
-			cortex_a_mmu_modify(target, 1);
+			cortex_a_mmu_modify(target, true);
 	}
 	return ERROR_OK;
 }
@@ -165,12 +165,12 @@ static int cortex_a_post_memaccess(struct target *target, int phys_access)
 /*  modify cp15_control_reg in order to enable or disable mmu for :
  *  - virt2phys address conversion
  *  - read or write memory in phys or virt address */
-static int cortex_a_mmu_modify(struct target *target, int enable)
+static int cortex_a_mmu_modify(struct target *target, bool enable)
 {
 	struct cortex_a_common *cortex_a = target_to_cortex_a(target);
 	struct armv7a_common *armv7a = target_to_armv7a(target);
 	int retval = ERROR_OK;
-	int need_write = 0;
+	bool need_write = false;
 
 	if (enable) {
 		/*  if mmu enabled at target stop and mmu not enable */
@@ -180,12 +180,12 @@ static int cortex_a_mmu_modify(struct target *target, int enable)
 		}
 		if ((cortex_a->cp15_control_reg_curr & 0x1U) == 0) {
 			cortex_a->cp15_control_reg_curr |= 0x1U;
-			need_write = 1;
+			need_write = true;
 		}
 	} else {
 		if ((cortex_a->cp15_control_reg_curr & 0x1U) == 0x1U) {
 			cortex_a->cp15_control_reg_curr &= ~0x1U;
-			need_write = 1;
+			need_write = true;
 		}
 	}
 
@@ -1118,19 +1118,18 @@ static int cortex_a_post_debug_entry(struct target *target)
 	if (!armv7a->is_armv7r)
 		armv7a_read_ttbcr(target);
 
-	if (armv7a->armv7a_mmu.armv7a_cache.info == -1)
+	if (!armv7a->armv7a_mmu.armv7a_cache.info_valid)
 		armv7a_identify_cache(target);
 
 	if (armv7a->is_armv7r) {
-		armv7a->armv7a_mmu.mmu_enabled = 0;
+		armv7a->armv7a_mmu.mmu_enabled = false;
 	} else {
-		armv7a->armv7a_mmu.mmu_enabled =
-			(cortex_a->cp15_control_reg & 0x1U) ? 1 : 0;
+		armv7a->armv7a_mmu.mmu_enabled = cortex_a->cp15_control_reg & 0x1U;
 	}
 	armv7a->armv7a_mmu.armv7a_cache.d_u_cache_enabled =
-		(cortex_a->cp15_control_reg & 0x4U) ? 1 : 0;
+		cortex_a->cp15_control_reg & 0x4U;
 	armv7a->armv7a_mmu.armv7a_cache.i_cache_enabled =
-		(cortex_a->cp15_control_reg & 0x1000U) ? 1 : 0;
+		cortex_a->cp15_control_reg & 0x1000U;
 	cortex_a->curr_mode = armv7a->arm.core_mode;
 
 	/* switch to SVC mode to read DACR */
@@ -2771,9 +2770,9 @@ static int cortex_a_read_phys_memory(struct target *target,
 		address, size, count);
 
 	/* read memory through the CPU */
-	cortex_a_prep_memaccess(target, 1);
+	cortex_a_prep_memaccess(target, true);
 	retval = cortex_a_read_cpu_memory(target, address, size, count, buffer);
-	cortex_a_post_memaccess(target, 1);
+	cortex_a_post_memaccess(target, true);
 
 	return retval;
 }
@@ -2787,9 +2786,9 @@ static int cortex_a_read_memory(struct target *target, target_addr_t address,
 	LOG_DEBUG("Reading memory at address " TARGET_ADDR_FMT "; size %" PRIu32 "; count %" PRIu32,
 		address, size, count);
 
-	cortex_a_prep_memaccess(target, 0);
+	cortex_a_prep_memaccess(target, false);
 	retval = cortex_a_read_cpu_memory(target, address, size, count, buffer);
-	cortex_a_post_memaccess(target, 0);
+	cortex_a_post_memaccess(target, false);
 
 	return retval;
 }
@@ -2807,9 +2806,9 @@ static int cortex_a_write_phys_memory(struct target *target,
 		address, size, count);
 
 	/* write memory through the CPU */
-	cortex_a_prep_memaccess(target, 1);
+	cortex_a_prep_memaccess(target, true);
 	retval = cortex_a_write_cpu_memory(target, address, size, count, buffer);
-	cortex_a_post_memaccess(target, 1);
+	cortex_a_post_memaccess(target, true);
 
 	return retval;
 }
@@ -2823,9 +2822,9 @@ static int cortex_a_write_memory(struct target *target, target_addr_t address,
 	LOG_DEBUG("Writing memory at address " TARGET_ADDR_FMT "; size %" PRIu32 "; count %" PRIu32,
 		address, size, count);
 
-	cortex_a_prep_memaccess(target, 0);
+	cortex_a_prep_memaccess(target, false);
 	retval = cortex_a_write_cpu_memory(target, address, size, count, buffer);
-	cortex_a_post_memaccess(target, 0);
+	cortex_a_post_memaccess(target, false);
 	return retval;
 }
 
@@ -3250,7 +3249,7 @@ static void cortex_a_deinit_target(struct target *target)
 	free(cortex_a);
 }
 
-static int cortex_a_mmu(struct target *target, int *enabled)
+static int cortex_a_mmu(struct target *target, bool *enabled)
 {
 	struct armv7a_common *armv7a = target_to_armv7a(target);
 
@@ -3260,7 +3259,7 @@ static int cortex_a_mmu(struct target *target, int *enabled)
 	}
 
 	if (armv7a->is_armv7r)
-		*enabled = 0;
+		*enabled = false;
 	else
 		*enabled = target_to_cortex_a(target)->armv7a_common.armv7a_mmu.mmu_enabled;
 
@@ -3271,7 +3270,7 @@ static int cortex_a_virt2phys(struct target *target,
 	target_addr_t virt, target_addr_t *phys)
 {
 	int retval;
-	int mmu_enabled = 0;
+	bool mmu_enabled = false;
 
 	/*
 	 * If the MMU was not enabled at debug entry, there is no
@@ -3286,7 +3285,7 @@ static int cortex_a_virt2phys(struct target *target,
 	}
 
 	/* mmu must be enable in order to get a correct translation */
-	retval = cortex_a_mmu_modify(target, 1);
+	retval = cortex_a_mmu_modify(target, true);
 	if (retval != ERROR_OK)
 		return retval;
 	return armv7a_mmu_translate_va_pa(target, (uint32_t)virt,

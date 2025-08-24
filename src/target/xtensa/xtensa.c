@@ -1556,7 +1556,7 @@ int xtensa_get_gdb_reg_list(struct target *target,
 	return ERROR_OK;
 }
 
-int xtensa_mmu_is_enabled(struct target *target, int *enabled)
+int xtensa_mmu_is_enabled(struct target *target, bool *enabled)
 {
 	struct xtensa *xtensa = target_to_xtensa(target);
 	*enabled = xtensa->core_config->mmu.itlb_entries_count > 0 ||
@@ -2077,17 +2077,16 @@ int xtensa_read_memory(struct target *target, target_addr_t address, uint32_t si
 			/* Disable fast memory access instructions and retry before reporting an error */
 			LOG_TARGET_DEBUG(target, "Disabling LDDR32.P/SDDR32.P");
 			xtensa->probe_lsddr32p = 0;
-			res = xtensa_read_memory(target, address, size, count, albuff);
-			bswap = false;
+			res = xtensa_read_memory(target, address, size, count, buffer);
 		} else {
 			LOG_TARGET_WARNING(target, "Failed reading %d bytes at address "TARGET_ADDR_FMT,
 				count * size, address);
 		}
+	} else {
+		if (bswap)
+			buf_bswap32(albuff, albuff, addrend_al - addrstart_al);
+		memcpy(buffer, albuff + (address & 3), (size * count));
 	}
-
-	if (bswap)
-		buf_bswap32(albuff, albuff, addrend_al - addrstart_al);
-	memcpy(buffer, albuff + (address & 3), (size * count));
 	free(albuff);
 	return res;
 }
