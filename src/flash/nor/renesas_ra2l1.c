@@ -152,8 +152,6 @@ static int ra2l1_force_moco(struct target *t)
 
     if (cksel == CKSEL_MOCO)
     {
-        bool fixed = false;
-
         if (((div & SCKDIVCR_ICK_Msk) >> SCKDIVCR_ICK_Pos) != 0u)
         {
             r = ra2l1_unlock_prcr(t);
@@ -164,7 +162,6 @@ static int ra2l1_force_moco(struct target *t)
             ra2l1_lock_prcr(t);
             if (r)
                 return r;
-            fixed = true;
         }
 
         uint8_t mw = 0xFF;
@@ -178,7 +175,6 @@ static int ra2l1_force_moco(struct target *t)
             ra2l1_lock_prcr(t);
             if (r)
                 return r;
-            fixed = true;
         }
 
         target_read_u8(t, REG_OSCSF, &oscsf);
