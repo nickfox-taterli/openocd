@@ -38,48 +38,6 @@
 #define FLCN_BASE 0x407EC000U
 #define REG_DFLCTL (FLCN_BASE + 0x0090)  // Data Flash Control
 #define REG_PFBER (FLCN_BASE + 0x3FC8)   // Prefetch Buffer Enable
-#define REG_FENTRYR (FLCN_BASE + 0x3FB0) // P/E mode entry
-#define REG_FPMCR (FLCN_BASE + 0x0100)   // Mode Control
-#define REG_FPR (FLCN_BASE + 0x0180)     // Protection Unlock
-#define REG_FCR (FLCN_BASE + 0x0114)     // Command Register
-#define REG_FRESETR (FLCN_BASE + 0x0124) // Error Reset
-#define REG_FISR (FLCN_BASE + 0x01D8)    // Frequency/Startup Area
-#define REG_FSARH (FLCN_BASE + 0x0110)   // Start Addr High
-#define REG_FSARL (FLCN_BASE + 0x0108)   // Start Addr Low
-#define REG_FEARH (FLCN_BASE + 0x0120)   // End Addr High
-#define REG_FEARL (FLCN_BASE + 0x0118)   // End Addr Low
-#define REG_FWBH0 (FLCN_BASE + 0x0138)   // Write Buffer High (code)
-#define REG_FWBL0 (FLCN_BASE + 0x0130)   // Write Buffer Low  (code & data)
-#define REG_FSTATR1 (FLCN_BASE + 0x012C) // Status 1 (FRDY)
-#define REG_FSTATR2 (FLCN_BASE + 0x01F0) // Status 2 (ERR)
-#define REG_FEAML (FLCN_BASE + 0x01E0)   // Error Address Low
-#define REG_FEAMH (FLCN_BASE + 0x01E8)   // Error Address High
-#define REG_FPSR (FLCN_BASE + 0x0184)    // Protection Status
-
-
-#define FENTRY_CODE_PE 0xAA01
-#define FENTRY_DATA_PE 0xAA80
-#define FENTRY_READ 0xAA00
-
-// FCR commands
-#define FCR_CMD_PROGRAM 0x81
-#define FCR_CMD_END1 0x01
-#define FCR_CMD_END0 0x00
-#define FCR_CMD_ERASE_SEQ 0x84 // erase sequence init
-#define FCR_CMD_ERASE 0x04     // block erase
-#define FCR_CMD_BLANKCHK 0x83
-
-// FPMCR mode bits (need to write FPR=0xA5 to unlock before writing)
-#define FPMCR_CODE_PE 0x02 // program/erase mode for code
-#define FPMCR_DATA_PE 0x10 // program/erase mode for data
-#define FPMCR_READ 0x08    // read mode
-
-// Status bits
-#define FSTATR1_FRDY (1U << 6)    // Flash ready
-#define FSTATR2_ERERR (1U << 0)   // Erase error
-#define FSTATR2_PRGERR (1U << 1)  // Program error
-#define FSTATR2_BCERR (1U << 3)   // Blank check error
-#define FSTATR2_ILGLERR (1U << 4) // Illegal command/error
 
 // Data flash control
 #define DFLCTL_DFLEN (1U << 0) // Data flash enable
@@ -96,24 +54,6 @@
 #define PRCR_PRC1 (1u << 1)
 #define PRCR_KEY_A5 (0xA5u << 8)
 
-#define REG_SCKDIVCR (SYSC_BASE + 0x020u) // Clock div register
-#define REG_SCKSCR (SYSC_BASE + 0x026u)   // Clock source select
-#define REG_MEMWAIT (SYSC_BASE + 0x031u)  // Memory wait control
-#define REG_HOCOCR (SYSC_BASE + 0x036u)   // HOCO control
-#define REG_MOCOCR (SYSC_BASE + 0x038u)   // MOCO control
-#define REG_OSCSF (SYSC_BASE + 0x03Cu)    // Oscillation flags
-#define REG_OPCCR (SYSC_BASE + 0x0A0u)    // Operation power mode
-
-// SCKSCR CKSEL: 0=HOCO, 1=MOCO (only these two are used here)
-#define CKSEL_HOCO 0x00u
-#define CKSEL_MOCO 0x01u
-
-// SCKDIVCR ICK field
-#define SCKDIVCR_ICK_Pos 24
-#define SCKDIVCR_ICK_Msk (0x7u << SCKDIVCR_ICK_Pos)
-
-// FISR.PCKA encoding for 8MHz operation
-#define FISR_PCKA_8MHZ 0b000111
 
 #define ARM_MODE_THUMB 0x00000020u
 
@@ -123,6 +63,7 @@ struct ra2l1_flash_bank
     bool is_data;     // true: data flash
 };
 
+// stub 源码 https://github.com/nickfox-taterli/ra2l1_stub
 static unsigned char ra2l1_stub_bin[] = {
   0x72, 0xb6, 0x03, 0x4b, 0x9d, 0x46, 0x00, 0xf0, 0xa1, 0xf9, 0xab, 0xbe,
   0xfe, 0xe7, 0x00, 0x00, 0x00, 0x7c, 0x00, 0x20, 0x40, 0xf2, 0xf0, 0x13,
@@ -353,6 +294,13 @@ static int ra2l1_flash_write(struct flash_bank *bank,
 	if (count == 0)
 		return ERROR_OK;
 
+	/* 记录开始时间 */
+	int64_t start_time = timeval_ms();
+	struct timeval tv_start;
+	gettimeofday(&tv_start, NULL);
+	LOG_INFO(LOG_PREFIX ": ra2l1_flash_write 开始 - 地址: 0x%08" TARGET_PRIxADDR ", 偏移: 0x%08" PRIx32 ", 大小: %" PRIu32 " 字节", 
+	         bank->base, offset, count);
+
 	struct target *target = bank->target;
 	int retval;
 
@@ -378,19 +326,51 @@ static int ra2l1_flash_write(struct flash_bank *bank,
 
 	/* 分片执行 stub：绝对地址 = bank->base + offset + off */
 	uint32_t off = 0;
+	uint32_t chunk_count = 0;
+	
 	while (off < count) {
 		uint32_t chunk = count - off;
 		if (chunk > RA2L1_CHUNK_MAX)
 			chunk = RA2L1_CHUNK_MAX;
 
 		uint32_t dst_abs = bank->base + offset + off;
+		chunk_count++;
+
+		/* 记录分块开始时间 */
+		int64_t current_chunk_start = timeval_ms();
+		LOG_INFO(LOG_PREFIX ": 处理分块 %u - 地址: 0x%08" PRIx32 ", 大小: %" PRIu32 " 字节", 
+		         chunk_count, dst_abs, chunk);
 
 		retval = ra2l1_run_stub_chunk(target, dst_abs, buffer + off, chunk);
-		if (retval != ERROR_OK)
+		if (retval != ERROR_OK) {
+			LOG_ERROR(LOG_PREFIX ": 分块 %u 处理失败", chunk_count);
 			return retval;
+		}
+
+		/* 计算分块耗时 */
+		int64_t current_chunk_end = timeval_ms();
+		int64_t chunk_duration = current_chunk_end - current_chunk_start;
+		LOG_INFO(LOG_PREFIX ": 分块 %u 完成 - 耗时: %" PRId64 " ms", chunk_count, chunk_duration);
 
 		off += chunk;
 	}
+
+	/* 计算总耗时 */
+	int64_t end_time = timeval_ms();
+	struct timeval tv_end;
+	gettimeofday(&tv_end, NULL);
+	int64_t total_duration = end_time - start_time;
+	
+	/* 计算详细时间差 */
+	int64_t sec_diff = tv_end.tv_sec - tv_start.tv_sec;
+	int64_t usec_diff = tv_end.tv_usec - tv_start.tv_usec;
+	if (usec_diff < 0) {
+		sec_diff--;
+		usec_diff += 1000000;
+	}
+
+	LOG_INFO(LOG_PREFIX ": ra2l1_flash_write 完成 - 总耗时: %" PRId64 " ms (%" PRId64 ".%06" PRId64 " 秒), 处理了 %u 个分块", 
+	         total_duration, sec_diff, usec_diff, chunk_count);
 
 	return ERROR_OK;
 }
