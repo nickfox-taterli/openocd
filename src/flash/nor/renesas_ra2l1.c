@@ -298,7 +298,7 @@ static int ra2l1_flash_write(struct flash_bank *bank,
 	int64_t start_time = timeval_ms();
 	struct timeval tv_start;
 	gettimeofday(&tv_start, NULL);
-	LOG_INFO(LOG_PREFIX ": ra2l1_flash_write 开始 - 地址: 0x%08" TARGET_PRIxADDR ", 偏移: 0x%08" PRIx32 ", 大小: %" PRIu32 " 字节", 
+	LOG_INFO(LOG_PREFIX ": ra2l1_flash_write started - address: 0x%08" TARGET_PRIxADDR ", offset: 0x%08" PRIx32 ", size: %" PRIu32 " bytes", 
 	         bank->base, offset, count);
 
 	struct target *target = bank->target;
@@ -338,19 +338,19 @@ static int ra2l1_flash_write(struct flash_bank *bank,
 
 		/* 记录分块开始时间 */
 		int64_t current_chunk_start = timeval_ms();
-		LOG_INFO(LOG_PREFIX ": 处理分块 %u - 地址: 0x%08" PRIx32 ", 大小: %" PRIu32 " 字节", 
+		LOG_INFO(LOG_PREFIX ": processing chunk %u - address: 0x%08" PRIx32 ", size: %" PRIu32 " bytes", 
 		         chunk_count, dst_abs, chunk);
 
 		retval = ra2l1_run_stub_chunk(target, dst_abs, buffer + off, chunk);
 		if (retval != ERROR_OK) {
-			LOG_ERROR(LOG_PREFIX ": 分块 %u 处理失败", chunk_count);
+			LOG_ERROR(LOG_PREFIX ": chunk %u processing failed", chunk_count);
 			return retval;
 		}
 
 		/* 计算分块耗时 */
 		int64_t current_chunk_end = timeval_ms();
 		int64_t chunk_duration = current_chunk_end - current_chunk_start;
-		LOG_INFO(LOG_PREFIX ": 分块 %u 完成 - 耗时: %" PRId64 " ms", chunk_count, chunk_duration);
+		LOG_INFO(LOG_PREFIX ": chunk %u completed - duration: %" PRId64 " ms", chunk_count, chunk_duration);
 
 		off += chunk;
 	}
@@ -369,7 +369,7 @@ static int ra2l1_flash_write(struct flash_bank *bank,
 		usec_diff += 1000000;
 	}
 
-	LOG_INFO(LOG_PREFIX ": ra2l1_flash_write 完成 - 总耗时: %" PRId64 " ms (%" PRId64 ".%06" PRId64 " 秒), 处理了 %u 个分块", 
+	LOG_INFO(LOG_PREFIX ": ra2l1_flash_write completed - total duration: %" PRId64 " ms (%" PRId64 ".%06" PRId64 " seconds), processed %u chunks", 
 	         total_duration, sec_diff, usec_diff, chunk_count);
 
 	return ERROR_OK;
