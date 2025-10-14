@@ -25,6 +25,12 @@
 #include "flash/nor/core.h"
 #include <stdlib.h>
 #include <string.h>
+#include "target/algorithm.h"     /* init_reg_param / destroy_reg_param / target_run_algorithm */
+#include "target/armv7m.h"        /* struct armv7m_algorithm / ARMV7M_COMMON_MAGIC */
+#include "target/arm.h"           /* 某些版本需要这个才能拿到 ARM_MODE_THUMB */
+#include "helper/binarybuffer.h"  /* buf_set_u32 / buf_get_u32 */
+#include "helper/log.h"
+#include <inttypes.h>
 
 #define LOG_PREFIX "ra2l1"
 
@@ -50,10 +56,7 @@
 #define REG_FEAMH (FLCN_BASE + 0x01E8)   // Error Address High
 #define REG_FPSR (FLCN_BASE + 0x0184)    // Protection Status
 
-#define REG_FACI_ERRATA 0x407EFFC4U
 
-// FENTRYR key and values
-#define FENTRY_KEY 0xAA
 #define FENTRY_CODE_PE 0xAA01
 #define FENTRY_DATA_PE 0xAA80
 #define FENTRY_READ 0xAA00
@@ -109,23 +112,189 @@
 #define SCKDIVCR_ICK_Pos 24
 #define SCKDIVCR_ICK_Msk (0x7u << SCKDIVCR_ICK_Pos)
 
-// FISR.PCKA encoding occupies 6 bits, below are placeholder values, final values based on manual
+// FISR.PCKA encoding for 8MHz operation
 #define FISR_PCKA_8MHZ 0b000111
-#define FISR_PCKA_48MHZ 0b100011 // placeholder only
 
-// Timeouts (ms)
-#define ERASE_TIMEOUT_MS 100
-#define PROG_TIMEOUT_MS 10
-
-// Bank indices
-#define BANK_CODE 0
-#define BANK_DATA 1
+#define ARM_MODE_THUMB 0x00000020u
 
 struct ra2l1_flash_bank
 {
     uint32_t pe_base; // P/E window base
     bool is_data;     // true: data flash
 };
+
+static unsigned char ra2l1_stub_bin[] = {
+  0x72, 0xb6, 0x03, 0x4b, 0x9d, 0x46, 0x00, 0xf0, 0xa1, 0xf9, 0xab, 0xbe,
+  0xfe, 0xe7, 0x00, 0x00, 0x00, 0x7c, 0x00, 0x20, 0x40, 0xf2, 0xf0, 0x13,
+  0x08, 0x4a, 0x00, 0x20, 0xd2, 0x58, 0xda, 0x3b, 0xff, 0x3b, 0x1a, 0x42,
+  0x08, 0xd0, 0x01, 0x21, 0x05, 0x4b, 0x03, 0x38, 0x9a, 0x6a, 0x0a, 0x43,
+  0x9a, 0x62, 0x9a, 0x6a, 0x8a, 0x43, 0x9a, 0x62, 0x70, 0x47, 0xc0, 0x46,
+  0x00, 0xc0, 0x7e, 0x40, 0xfc, 0xc0, 0x7e, 0x40, 0x0e, 0x4a, 0x43, 0x1e,
+  0x59, 0x18, 0x03, 0x0c, 0x10, 0xb5, 0x80, 0xb2, 0x53, 0x82, 0x0c, 0x4b,
+  0x50, 0x81, 0x08, 0x0c, 0x89, 0xb2, 0x58, 0x62, 0x51, 0x83, 0x84, 0x21,
+  0x09, 0x4a, 0x51, 0x75, 0x19, 0x6b, 0x49, 0x06, 0xfc, 0xd5, 0x04, 0x21,
+  0x51, 0x75, 0x00, 0x21, 0x51, 0x75, 0x1a, 0x6b, 0x52, 0x06, 0xfc, 0xd4,
+  0xff, 0xf7, 0xcc, 0xff, 0x10, 0xbd, 0xc0, 0x46, 0xfe, 0xc0, 0x7e, 0x40,
+  0xfc, 0xc0, 0x7e, 0x40, 0xff, 0xc0, 0x7e, 0x40, 0x28, 0x23, 0x82, 0xb0,
+  0x01, 0x93, 0x01, 0x9b, 0x5a, 0x1e, 0x01, 0x92, 0x0b, 0xb9, 0x02, 0xb0,
+  0x70, 0x47, 0xc0, 0x46, 0xc0, 0x46, 0xc0, 0x46, 0xc0, 0x46, 0xf4, 0xe7,
+  0x43, 0xf6, 0xb2, 0x73, 0x10, 0xb5, 0x09, 0x4a, 0x09, 0x4c, 0xe2, 0x52,
+  0xff, 0xf7, 0xea, 0xff, 0x40, 0xf2, 0x80, 0x13, 0xa5, 0x22, 0xe2, 0x50,
+  0x71, 0x3b, 0xff, 0x34, 0xff, 0x3b, 0x4a, 0x32, 0x63, 0x70, 0x62, 0x70,
+  0x63, 0x70, 0xff, 0xf7, 0xdd, 0xff, 0x10, 0xbd, 0x80, 0xaa, 0xff, 0xff,
+  0x00, 0xc0, 0x7e, 0x40, 0x40, 0xf2, 0x80, 0x13, 0xa5, 0x22, 0x10, 0xb5,
+  0x07, 0x4c, 0xf7, 0x21, 0xe2, 0x50, 0x23, 0x00, 0x9d, 0x3a, 0xff, 0x33,
+  0x5a, 0x70, 0x59, 0x70, 0x5a, 0x70, 0xff, 0xf7, 0xc9, 0xff, 0x43, 0xf6,
+  0xb2, 0x73, 0x02, 0x4a, 0xe2, 0x52, 0x10, 0xbd, 0x00, 0xc0, 0x7e, 0x40,
+  0x00, 0xaa, 0xff, 0xff, 0x70, 0xb5, 0xe9, 0xb1, 0x85, 0x0a, 0x01, 0x38,
+  0x44, 0x18, 0x40, 0xf2, 0x00, 0x46, 0xff, 0xf7, 0xc5, 0xff, 0xa4, 0x0a,
+  0xad, 0x02, 0xa4, 0x02, 0xfe, 0x23, 0x1b, 0x06, 0x31, 0x00, 0xe8, 0x18,
+  0xff, 0xf7, 0x8a, 0xff, 0x20, 0xb1, 0xff, 0xf7, 0xd3, 0xff, 0x03, 0x20,
+  0x40, 0x42, 0x70, 0xbd, 0xa5, 0x42, 0x03, 0xd0, 0x40, 0xf2, 0x00, 0x43,
+  0xed, 0x18, 0xed, 0xe7, 0xff, 0xf7, 0xc8, 0xff, 0x00, 0x20, 0xf4, 0xe7,
+  0x70, 0xb5, 0x00, 0x29, 0x2b, 0xd0, 0x43, 0xf6, 0xb2, 0x72, 0xc5, 0x0a,
+  0x01, 0x38, 0x15, 0x4b, 0x44, 0x18, 0x15, 0x49, 0x40, 0xf6, 0x00, 0x06,
+  0x99, 0x52, 0x40, 0xf2, 0x80, 0x12, 0xa5, 0x21, 0x99, 0x50, 0x12, 0x4b,
+  0x7f, 0x3a, 0xff, 0x3a, 0x58, 0x31, 0x5a, 0x70, 0x59, 0x70, 0x5a, 0x70,
+  0xff, 0xf7, 0x84, 0xff, 0xe4, 0x0a, 0xed, 0x02, 0xe4, 0x02, 0x31, 0x00,
+  0x28, 0x00, 0xff, 0xf7, 0x59, 0xff, 0x20, 0xb1, 0xff, 0xf7, 0xa2, 0xff,
+  0x03, 0x20, 0x40, 0x42, 0x70, 0xbd, 0xa5, 0x42, 0x03, 0xd0, 0x40, 0xf6,
+  0x00, 0x03, 0xed, 0x18, 0xef, 0xe7, 0xff, 0xf7, 0x97, 0xff, 0x00, 0x20,
+  0xf4, 0xe7, 0xc0, 0x46, 0x00, 0xc0, 0x7e, 0x40, 0x01, 0xaa, 0xff, 0xff,
+  0xff, 0xc0, 0x7e, 0x40, 0x05, 0x4b, 0x10, 0xb5, 0xc3, 0x18, 0x00, 0x20,
+  0x90, 0x42, 0x00, 0xd1, 0x10, 0xbd, 0x1c, 0x18, 0x24, 0x78, 0x0c, 0x54,
+  0x01, 0x30, 0xf7, 0xe7, 0x00, 0x00, 0x10, 0x40, 0x03, 0x00, 0x00, 0x20,
+  0x10, 0xb5, 0x90, 0x42, 0x00, 0xd1, 0x10, 0xbd, 0xc4, 0x18, 0x24, 0x78,
+  0x0c, 0x54, 0x01, 0x30, 0xf7, 0xe7, 0x00, 0x00, 0xf8, 0xb5, 0x0c, 0x00,
+  0x16, 0x00, 0x0d, 0x00, 0x29, 0xb3, 0x00, 0x25, 0x1a, 0xb3, 0xfe, 0x23,
+  0x01, 0x27, 0x1b, 0x06, 0xc5, 0x18, 0xff, 0xf7, 0x4d, 0xff, 0x11, 0x4b,
+  0x2a, 0x0c, 0xad, 0xb2, 0x5a, 0x82, 0xa6, 0x19, 0x5d, 0x81, 0x81, 0x21,
+  0x23, 0x78, 0x0e, 0x4a, 0x53, 0x63, 0x0e, 0x4b, 0x59, 0x75, 0x11, 0x6b,
+  0x49, 0x06, 0xfc, 0xd5, 0x00, 0x21, 0x5f, 0x75, 0x59, 0x75, 0x13, 0x6b,
+  0x5b, 0x06, 0xfc, 0xd4, 0xff, 0xf7, 0xec, 0xfe, 0x05, 0x00, 0x30, 0xb9,
+  0x01, 0x34, 0xb4, 0x42, 0xe9, 0xd1, 0xff, 0xf7, 0x49, 0xff, 0x28, 0x00,
+  0xf8, 0xbd, 0x03, 0x25, 0x6d, 0x42, 0xf8, 0xe7, 0xfe, 0xc0, 0x7e, 0x40,
+  0xfc, 0xc0, 0x7e, 0x40, 0xff, 0xc0, 0x7e, 0x40, 0xf0, 0xb5, 0x87, 0xb0,
+  0x0d, 0x00, 0x0f, 0x00, 0x05, 0x90, 0x01, 0x92, 0x00, 0x29, 0x59, 0xd0,
+  0x00, 0x27, 0x00, 0x2a, 0x56, 0xd0, 0x43, 0xf6, 0xb2, 0x72, 0x2f, 0x4b,
+  0x2f, 0x49, 0x30, 0x4e, 0x99, 0x52, 0x40, 0xf2, 0x80, 0x12, 0xa5, 0x21,
+  0x99, 0x50, 0x02, 0x23, 0x83, 0x3a, 0x73, 0x70, 0x72, 0x70, 0x73, 0x70,
+  0xff, 0xf7, 0xfa, 0xfe, 0x3c, 0x00, 0x01, 0x9b, 0x18, 0x1b, 0x02, 0x90,
+  0x04, 0x28, 0x01, 0xd9, 0x04, 0x23, 0x02, 0x93, 0x2b, 0x5d, 0x04, 0x93,
+  0x01, 0x28, 0x3c, 0xd0, 0xff, 0x22, 0x2f, 0x19, 0x7b, 0x78, 0x11, 0x00,
+  0x03, 0x93, 0x02, 0x28, 0x03, 0xd0, 0xb9, 0x78, 0x03, 0x28, 0x00, 0xd0,
+  0xfa, 0x78, 0x05, 0x98, 0x00, 0x19, 0x87, 0x07, 0x31, 0xd1, 0x07, 0x0c,
+  0xbc, 0x46, 0x63, 0x46, 0x1b, 0x4f, 0x09, 0x04, 0x7b, 0x82, 0x03, 0x9b,
+  0x12, 0x06, 0x1b, 0x02, 0x0b, 0x43, 0x04, 0x99, 0x80, 0xb2, 0x0b, 0x43,
+  0x17, 0x49, 0x1a, 0x43, 0x9b, 0xb2, 0x78, 0x81, 0x4b, 0x63, 0x81, 0x23,
+  0x12, 0x0c, 0xca, 0x63, 0x73, 0x75, 0x0b, 0x6b, 0x5b, 0x06, 0xfc, 0xd5,
+  0x01, 0x23, 0x73, 0x75, 0x00, 0x23, 0x73, 0x75, 0x0b, 0x6b, 0x5b, 0x06,
+  0xfc, 0xd4, 0xff, 0xf7, 0x81, 0xfe, 0x07, 0x00, 0x68, 0xb9, 0x02, 0x9b,
+  0xe4, 0x18, 0x01, 0x9b, 0xa3, 0x42, 0xbc, 0xd8, 0xff, 0xf7, 0xdc, 0xfe,
+  0x38, 0x00, 0x07, 0xb0, 0xf0, 0xbd, 0xff, 0x22, 0x11, 0x00, 0x03, 0x92,
+  0xc9, 0xe7, 0x03, 0x27, 0x7f, 0x42, 0xf3, 0xe7, 0x00, 0xc0, 0x7e, 0x40,
+  0x01, 0xaa, 0xff, 0xff, 0xff, 0xc0, 0x7e, 0x40, 0xfe, 0xc0, 0x7e, 0x40,
+  0xfc, 0xc0, 0x7e, 0x40, 0x10, 0xb5, 0x00, 0xf0, 0x01, 0xf8, 0x10, 0xbd,
+  0xf8, 0xb5, 0x40, 0xf2, 0xfe, 0x33, 0x0d, 0x00, 0x16, 0x00, 0x34, 0x49,
+  0x34, 0x4a, 0x04, 0x00, 0xd1, 0x52, 0x01, 0x21, 0x33, 0x48, 0x34, 0x4f,
+  0x01, 0x70, 0x43, 0xf6, 0xc8, 0x70, 0x39, 0x54, 0x32, 0x49, 0xd1, 0x52,
+  0x32, 0x4b, 0x9c, 0x42, 0x30, 0xd9, 0x16, 0xb9, 0x05, 0x20, 0x40, 0x42,
+  0x01, 0xe0, 0x0d, 0xb9, 0x00, 0x20, 0xf8, 0xbd, 0x2e, 0x4b, 0xe4, 0x18,
+  0x41, 0xf6, 0xff, 0x73, 0x9c, 0x42, 0x48, 0xd8, 0x42, 0xf2, 0x00, 0x02,
+  0x2b, 0x19, 0x93, 0x42, 0x43, 0xd8, 0x29, 0x00, 0x20, 0x00, 0xff, 0xf7,
+  0xb1, 0xfe, 0x08, 0xb1, 0x04, 0x20, 0xe8, 0xe7, 0x2a, 0x00, 0x31, 0x00,
+  0x20, 0x00, 0xff, 0xf7, 0x1d, 0xff, 0x07, 0x00, 0x00, 0x28, 0xdf, 0xd1,
+  0x2a, 0x00, 0x20, 0x00, 0x21, 0x49, 0xff, 0xf7, 0xfb, 0xfe, 0x20, 0x4b,
+  0xf1, 0x5d, 0xfa, 0x5c, 0x91, 0x42, 0x03, 0xd1, 0x01, 0x37, 0xbd, 0x42,
+  0xf8, 0xd1, 0xd5, 0xe7, 0x06, 0x20, 0xd0, 0xe7, 0x00, 0x2d, 0xd1, 0xd0,
+  0x80, 0x23, 0xdb, 0x02, 0x9c, 0x42, 0x1e, 0xd2, 0x62, 0x19, 0x9a, 0x42,
+  0x1b, 0xd8, 0x29, 0x00, 0x20, 0x00, 0xff, 0xf7, 0xab, 0xfe, 0x00, 0x28,
+  0xd6, 0xd1, 0x2a, 0x00, 0x31, 0x00, 0x20, 0x00, 0xff, 0xf7, 0x2c, 0xff,
+  0x07, 0x00, 0x00, 0x28, 0xb8, 0xd1, 0x2a, 0x00, 0x20, 0x00, 0x0e, 0x49,
+  0xff, 0xf7, 0xe2, 0xfe, 0x0c, 0x4b, 0xf1, 0x5d, 0xfa, 0x5c, 0x91, 0x42,
+  0xdc, 0xd1, 0x01, 0x37, 0xbd, 0x42, 0xf8, 0xd1, 0xae, 0xe7, 0x02, 0x20,
+  0xa9, 0xe7, 0xc0, 0x46, 0x03, 0xa5, 0xff, 0xff, 0x00, 0xe0, 0x01, 0x40,
+  0x90, 0xc0, 0x7e, 0x40, 0x00, 0xc0, 0x7e, 0x40, 0x00, 0xa5, 0xff, 0xff,
+  0xff, 0xff, 0x0f, 0x40, 0x00, 0x00, 0xf0, 0xbf, 0x00, 0x30, 0x00, 0x20
+};
+
+unsigned int ra2l1_stub_bin_len = 1104;
+
+/* ====== 固定内存布局（与链接脚本一致） ====== */
+#define RA2L1_STUB_BASE    0x20006000u
+#define RA2L1_STUB_SIZE    0x00002000u  /* 保险：不小于 .text 实际大小 */
+#define RA2L1_STUB_ENTRY   (RA2L1_STUB_BASE | 1u)  /* Thumb 入口 */
+#define RA2L1_STUB_SP      0x20007C00u
+
+#define RA2L1_WORKBUF      0x20000100u   /* 主机→目标数据暂存区（避开 DUMP_ADDR 与 stub） */
+#define RA2L1_CHUNK_MAX    0x2000u       /* 8 KB：保证不与 DUMP_ADDR(0x20003000) 与 stub(0x20006000) 重叠 */
+#define RA2L1_CHUNK_MIN    0x0100u
+
+#define RA2L1_BKPT_NUM     0xAB          /* 与 stub 内 BKPT #0xAB 对齐 */
+
+
+static int ra2l1_run_stub_chunk(struct target *target,
+				uint32_t dst_abs,
+				const uint8_t *src_host,
+				uint32_t len)
+{
+	int retval;
+
+	/* 把本片数据拷到目标 RAM */
+	retval = target_write_buffer(target, RA2L1_WORKBUF, len, src_host);
+	if (retval != ERROR_OK) {
+		LOG_ERROR("RA2L1: write workbuf failed (%d)", retval);
+		return retval;
+	}
+
+	/* r0/r1/r2/sp 准备 */
+	struct reg_param regs[4];
+	init_reg_param(&regs[0], "r0", 32, PARAM_IN_OUT);
+	init_reg_param(&regs[1], "r1", 32, PARAM_IN_OUT);
+	init_reg_param(&regs[2], "r2", 32, PARAM_IN_OUT);
+	init_reg_param(&regs[3], "sp", 32, PARAM_OUT);
+
+	buf_set_u32(regs[0].value, 0, 32, dst_abs);
+	buf_set_u32(regs[1].value, 0, 32, len);
+	buf_set_u32(regs[2].value, 0, 32, RA2L1_WORKBUF);
+	buf_set_u32(regs[3].value, 0, 32, RA2L1_STUB_SP);
+
+	struct armv7m_algorithm algo;
+	memset(&algo, 0, sizeof(algo));
+	algo.common_magic = ARMV7M_COMMON_MAGIC;
+	algo.core_mode    = ARM_MODE_THUMB;
+
+	retval = target_run_algorithm(target,
+		0, NULL,                 /* mem params */
+		ARRAY_SIZE(regs), regs,  /* reg params */
+		RA2L1_STUB_ENTRY, 0,     /* entry / exit unused (BKPT) */
+		10000,                   /* timeout ms，可按片大小扩 */
+		&algo);
+
+	if (retval != ERROR_OK) {
+		LOG_ERROR("RA2L1: stub run failed (%d) @0x%08" PRIx32 " len=%" PRIu32,
+		          retval, dst_abs, len);
+		goto out;
+	}
+
+	/* r0 = stub 返回码 */
+	uint32_t stub_status = buf_get_u32(regs[0].value, 0, 32);
+	if (stub_status != 0) {
+		LOG_ERROR("RA2L1: stub status=0x%08" PRIx32 " @0x%08" PRIx32 " len=%" PRIu32,
+		          stub_status, dst_abs, len);
+		retval = (stub_status == (uint32_t)-6) ? ERROR_FAIL : ERROR_FLASH_OPERATION_FAILED;
+	} else {
+		retval = ERROR_OK;
+	}
+
+out:
+	destroy_reg_param(&regs[0]);
+	destroy_reg_param(&regs[1]);
+	destroy_reg_param(&regs[2]);
+	destroy_reg_param(&regs[3]);
+	return retval;
+}
+
 
 // Utility: unlock/lock write protection register
 static inline int ra2l1_unlock_prcr(struct target *t)
@@ -138,342 +307,13 @@ static inline int ra2l1_lock_prcr(struct target *t)
     return target_write_u16(t, REG_PRCR, PRCR_KEY_A5);
 }
 
-// Force to MOCO function: switch ICLK to MOCO 8MHz, and ensure ICK=/1, MEMWAIT=0
-// Here we only do "steady state 8MHz", convenient for using 8MHz PCKA value in FISR later
-static int ra2l1_force_moco(struct target *t)
-{
-    int r;
-    uint8_t oscsf = 0, cksel = 0;
-    uint32_t div = 0;
 
-    target_read_u8(t, REG_OSCSF, &oscsf);
-    target_read_u8(t, REG_SCKSCR, &cksel);
-    target_read_u32(t, REG_SCKDIVCR, &div);
-
-    if (cksel == CKSEL_MOCO)
-    {
-        if (((div & SCKDIVCR_ICK_Msk) >> SCKDIVCR_ICK_Pos) != 0u)
-        {
-            r = ra2l1_unlock_prcr(t);
-            if (r)
-                return r;
-            div = (div & ~SCKDIVCR_ICK_Msk) | (0u << SCKDIVCR_ICK_Pos);
-            r = target_write_u32(t, REG_SCKDIVCR, div);
-            ra2l1_lock_prcr(t);
-            if (r)
-                return r;
-        }
-
-        uint8_t mw = 0xFF;
-        target_read_u8(t, REG_MEMWAIT, &mw);
-        if (mw != 0)
-        {
-            r = ra2l1_unlock_prcr(t);
-            if (r)
-                return r;
-            r = target_write_u8(t, REG_MEMWAIT, 0);
-            ra2l1_lock_prcr(t);
-            if (r)
-                return r;
-        }
-
-        target_read_u8(t, REG_OSCSF, &oscsf);
-        target_read_u8(t, REG_SCKSCR, &cksel);
-        target_read_u32(t, REG_SCKDIVCR, &div);
-        // LOG_INFO(LOG_PREFIX ": force MOCO: already MOCO; %sfixed. OSCSF=0x%02x, SCKSCR=0x%02x, ICKdiv=%u, MEMWAIT=%u",
-        //          fixed ? "" : "no-", oscsf, cksel,
-        //          (unsigned)((div & SCKDIVCR_ICK_Msk) >> SCKDIVCR_ICK_Pos),
-        //          (unsigned)mw);
-        return ERROR_OK;
-    }
-
-    r = ra2l1_unlock_prcr(t);
-    if (r)
-        return r;
-
-    r = target_write_u8(t, REG_MOCOCR, 0x00);
-    if (r)
-        goto out_lock;
-
-    r = target_write_u8(t, REG_MEMWAIT, 0);
-    if (r)
-        goto out_lock;
-
-    // If needed to enable FACI features per chip errata, uncomment here; default keep disabled to avoid issues
-    // r = target_write_u8(t, REG_FACI_ERRATA, 1);
-
-    r = target_write_u8(t, REG_SCKSCR, CKSEL_MOCO);
-    if (r)
-        goto out_lock;
-
-    r = target_read_u32(t, REG_SCKDIVCR, &div);
-    if (r)
-        goto out_lock;
-    div = (div & ~SCKDIVCR_ICK_Msk) | (0u << SCKDIVCR_ICK_Pos);
-    r = target_write_u32(t, REG_SCKDIVCR, div);
-    if (r)
-        goto out_lock;
-
-    target_read_u8(t, REG_OSCSF, &oscsf);
-    target_read_u8(t, REG_SCKSCR, &cksel);
-    target_read_u32(t, REG_SCKDIVCR, &div);
-    {
-        uint8_t mw = 0xFF;
-        target_read_u8(t, REG_MEMWAIT, &mw);
-        LOG_INFO(LOG_PREFIX ": force MOCO: switched. OSCSF=0x%02x, SCKSCR=0x%02x, ICKdiv=%u, MEMWAIT=%u",
-                 oscsf, cksel, (unsigned)((div & SCKDIVCR_ICK_Msk) >> SCKDIVCR_ICK_Pos), (unsigned)mw);
-    }
-
-out_lock:
-    ra2l1_lock_prcr(t);
-    return r;
-}
-
-// FRDY polling & prefetch control
-static int ra2l1_wait_frdy(struct target *t, bool ready, int timeout_ms)
-{
-    int64_t start = timeval_ms();
-    uint32_t st;
-    while (timeval_ms() - start < timeout_ms)
-    {
-        target_read_u32(t, REG_FSTATR1, &st);
-        if (!!(st & FSTATR1_FRDY) == ready)
-            return ERROR_OK;
-    }
-    return ERROR_TIMEOUT_REACHED;
-}
-
+// Prefetch control
 static inline int ra2l1_prefetch_enable(struct target *t, bool en)
 {
     return target_write_u8(t, REG_PFBER, en ? 1 : 0);
 }
 
-// Enter/exit P/E, on entering P/E also write FISR.PCKA (for 8MHz)
-static int ra2l1_enter_pe(struct target *t, bool data)
-{
-    int r = target_write_u16(t, REG_FENTRYR, data ? FENTRY_DATA_PE : FENTRY_CODE_PE);
-    if (r)
-        return r;
-
-    r = target_write_u8(t, REG_FPR, 0xA5) ||
-        target_write_u8(t, REG_FPMCR, data ? FPMCR_DATA_PE : FPMCR_CODE_PE) ||
-        target_write_u8(t, REG_FPMCR, (uint8_t)~(data ? FPMCR_DATA_PE : FPMCR_CODE_PE)) ||
-        target_write_u8(t, REG_FPMCR, data ? FPMCR_DATA_PE : FPMCR_CODE_PE);
-    if (r)
-        return r;
-
-    r = target_write_u8(t, REG_FISR, FISR_PCKA_8MHZ);
-    return r;
-}
-
-static int ra2l1_exit_pe(struct target *t)
-{
-    int r = target_write_u16(t, REG_FENTRYR, FENTRY_READ);
-    if (r)
-        return r;
-
-    return target_write_u8(t, REG_FPR, 0xA5) ||
-           target_write_u8(t, REG_FPMCR, FPMCR_READ) ||
-           target_write_u8(t, REG_FPMCR, (uint8_t)~FPMCR_READ) ||
-           target_write_u8(t, REG_FPMCR, FPMCR_READ);
-}
-
-// Check and clear errors
-static int ra2l1_check_errors(struct target *t)
-{
-    uint32_t st2 = 0;
-    target_read_u32(t, REG_FSTATR2, &st2);
-    if (st2 & (FSTATR2_ERERR | FSTATR2_PRGERR | FSTATR2_BCERR | FSTATR2_ILGLERR))
-    {
-        LOG_INFO(LOG_PREFIX ": flash error=0x%08" PRIx32, st2);
-        target_write_u32(t, REG_FRESETR, 1);
-        target_write_u32(t, REG_FRESETR, 0);
-        return ERROR_FAIL;
-    }
-    return ERROR_OK;
-}
-
-// Address conversion & sequence synchronization
-static inline uint32_t ra2l1_to_pe_addr(struct flash_bank *bank, uint32_t off)
-{
-    struct ra2l1_flash_bank *info = bank->driver_priv;
-    return info->pe_base + off;
-}
-
-static int ra2l1_seq_sync(struct target *t)
-{
-    uint32_t st1;
-    target_write_u8(t, REG_FCR, 0x00);
-    target_read_u32(t, REG_FSTATR1, &st1);
-    if (st1 & FSTATR1_FRDY)
-    {
-        target_write_u32(t, REG_FRESETR, 1);
-        target_write_u32(t, REG_FRESETR, 0);
-    }
-    return ERROR_OK;
-}
-
-/*
- * Program a unit:
- *  - Code Flash: write 32bit at once, address needs 4-byte alignment
- *  - Data Flash: write 8bit at once
- * Flow reference Figure 37.19: load address → load data → FCR=0x81 → wait FRDY=1 (accepted)
- * → FCR=0x01 → FCR=0x00 → wait FRDY=0 (enter busy) → check early errors → return
- * Do not wait for final completion; use ra2l1_seq_sync() at segment end for unified cleanup
- */
-static int ra2l1_program(struct flash_bank *bank, uint32_t addr, const void *data, unsigned size)
-{
-    struct target *t = bank->target;
-    int r;
-
-    if (size == 4 && (addr & 0x3))
-    {
-        LOG_ERROR(LOG_PREFIX ": program addr not 4-byte aligned: 0x%08x", addr);
-        return ERROR_FAIL;
-    }
-
-    r = target_write_u16(t, REG_FSARL, (uint16_t)(addr & 0xFFFF)) ||
-        target_write_u16(t, REG_FSARH, (uint16_t)(addr >> 16));
-    if (r)
-        return r;
-
-    if (size == 4)
-    {
-        uint32_t w;
-        memcpy(&w, data, 4);
-        r = target_write_u32(t, REG_FWBL0, w) || target_write_u32(t, REG_FWBH0, w >> 16);
-    }
-    else
-    {
-        uint8_t b = *(const uint8_t *)data;
-        r = target_write_u8(t, REG_FWBL0, b);
-        if (r)
-            return r;
-    }
-
-    r = target_write_u8(t, REG_FCR, FCR_CMD_PROGRAM);
-    if (r)
-        return r;
-
-    r = ra2l1_wait_frdy(t, true, 5);
-    if (r)
-    {
-        uint32_t st1 = 0, st2 = 0;
-        target_read_u32(t, REG_FSTATR1, &st1);
-        target_read_u32(t, REG_FSTATR2, &st2);
-        LOG_ERROR(LOG_PREFIX ": program: FRDY not 1 after 0x81 @0x%08x (FSTATR1=0x%08x,FSTATR2=0x%08x)",
-                  addr, st1, st2);
-        target_write_u32(t, REG_FRESETR, 1);
-        target_write_u32(t, REG_FRESETR, 0);
-        return r;
-    }
-
-    r = target_write_u8(t, REG_FCR, FCR_CMD_END1);
-    if (r)
-        return r;
-    r = target_write_u8(t, REG_FCR, FCR_CMD_END0);
-    if (r)
-        return r;
-
-    {
-        uint32_t st1 = 0;
-        int64_t t0 = timeval_ms();
-        do
-        {
-            target_read_u32(t, REG_FSTATR1, &st1);
-            if ((st1 & FSTATR1_FRDY) == 0)
-                break;
-        } while (timeval_ms() - t0 < 5);
-
-        if (st1 & FSTATR1_FRDY)
-        {
-            uint32_t st2 = 0;
-            target_read_u32(t, REG_FSTATR2, &st2);
-            LOG_ERROR(LOG_PREFIX ": program: did not enter busy @0x%08x (FSTATR2=0x%08x)", addr, st2);
-            target_write_u32(t, REG_FRESETR, 1);
-            target_write_u32(t, REG_FRESETR, 0);
-            return ERROR_FAIL;
-        }
-    }
-
-    {
-        uint32_t st2 = 0;
-        target_read_u32(t, REG_FSTATR2, &st2);
-        if (st2 & (FSTATR2_ILGLERR | FSTATR2_PRGERR))
-        {
-            uint32_t feah = 0, feal = 0;
-            target_read_u32(t, REG_FEAMH, &feah);
-            target_read_u32(t, REG_FEAML, &feal);
-            LOG_ERROR(LOG_PREFIX ": program early error @0x%08x, FSTATR2=0x%08x, FEAR=0x%04x%04x",
-                      addr, st2, (unsigned)feah, (unsigned)feal);
-            target_write_u32(t, REG_FRESETR, 1);
-            target_write_u32(t, REG_FRESETR, 0);
-            return ERROR_FAIL;
-        }
-    }
-
-    return ERROR_OK;
-}
-
-// Block erase: follow Figure 37.23 flow, first 0x84 accepted, then 0x04 + 0x00 to start
-// On entry FRDY may be 0 or 1, on exit as long as FRDY=0 it counts as start success; errors checked after completion
-static int ra2l1_block_erase(struct flash_bank *bank, uint32_t addr)
-{
-    struct target *t = bank->target;
-    struct ra2l1_flash_bank *info = bank->driver_priv;
-    const uint32_t blk_sz = info->is_data ? 1024u : 2048u;
-    const uint32_t start = addr;
-    const uint32_t end = addr + blk_sz - 1;
-
-    int r = 0;
-
-    LOG_DEBUG(LOG_PREFIX ": erase @0x%08x..0x%08x", start, end);
-
-    r = target_write_u16(t, REG_FSARL, start & 0xFFFF) ||
-        target_write_u16(t, REG_FSARH, start >> 16) ||
-        target_write_u16(t, REG_FEARL, end & 0xFFFF) ||
-        target_write_u16(t, REG_FEARH, end >> 16);
-    if (r)
-        return r;
-
-    r = target_write_u8(t, REG_FCR, FCR_CMD_ERASE_SEQ);
-    if (r)
-        return r;
-
-    r = ra2l1_wait_frdy(t, true, 100);
-    if (r)
-    {
-        LOG_ERROR(LOG_PREFIX ": erase seq 0x84 not accepted @0x%08x..0x%08x", start, end);
-        return r;
-    }
-
-    r = target_write_u8(t, REG_FCR, FCR_CMD_ERASE);
-    if (r)
-        return r;
-    r = target_write_u8(t, REG_FCR, FCR_CMD_END0);
-    if (r)
-        return r;
-
-    r = ra2l1_wait_frdy(t, false, 1000);
-    if (r)
-    {
-        LOG_ERROR(LOG_PREFIX ": erase timeout");
-        return r;
-    }
-
-    r = ra2l1_check_errors(t);
-    if (r)
-    {
-        uint32_t feah = 0, feal = 0;
-        target_read_u32(t, REG_FEAMH, &feah);
-        target_read_u32(t, REG_FEAML, &feal);
-        LOG_ERROR(LOG_PREFIX ": erase error @0x%08x..0x%08x, FEAR=0x%04x%04x",
-                  start, end, (unsigned)feah, (unsigned)feal);
-        return r;
-    }
-
-    return ERROR_OK;
-}
 
 // Device information (print only once)
 static void ra2l1_read_chip_info(struct target *t)
@@ -503,354 +343,58 @@ static void ra2l1_read_chip_info(struct target *t)
     LOG_INFO(LOG_PREFIX ": Part#='%s', Ver=0x%02x", part, ver);
 }
 
-// Pre-scan: only compare non-0xFF bytes in image; skip if entire block identical
-static int ra2l1_prescan_mark_blocks(struct flash_bank *bank,
-                                     const uint8_t *buf,
-                                     uint32_t offset,
-                                     uint32_t count,
-                                     uint8_t *mark)
-{
-    struct ra2l1_flash_bank *info = bank->driver_priv;
-    const uint32_t blk_sz = info->is_data ? 1024u : 2048u;
 
-    const uint32_t first_blk = offset / blk_sz;
-    const uint32_t last_blk = (offset + count - 1) / blk_sz;
-
-    uint32_t first_diff_idx = 0;
-
-    uint8_t *cur = (uint8_t *)malloc(blk_sz);
-    if (!cur)
-        return ERROR_FAIL;
-
-    for (uint32_t b = first_blk; b <= last_blk; ++b)
-    {
-        const uint32_t b_off = b * blk_sz;
-        const uint32_t s = (b_off < offset) ? offset : b_off;
-        const uint32_t e = ((b_off + blk_sz) > (offset + count)) ? (offset + count) : (b_off + blk_sz);
-
-        mark[b] = 0;
-        if (e <= s)
-            continue;
-
-        int r = target_read_memory(bank->target, bank->base + b_off, 1, blk_sz, cur);
-        if (r)
-        {
-            LOG_ERROR(LOG_PREFIX ": prescan: read block %u @ [0x%08x..0x%08x] failed (%d)",
-                      (unsigned)b, (unsigned)b_off, (unsigned)(b_off + blk_sz - 1), r);
-            free(cur);
-            return r;
-        }
-
-        const uint8_t *bp = buf + (s - offset);
-        const uint8_t *mp = cur + (s - b_off);
-        const uint32_t cmp_len = e - s;
-
-        for (uint32_t i = 0; i < cmp_len; ++i)
-        {
-            uint8_t bi = bp[i];
-            if (bi == 0xFF)
-                continue;
-            if (bi != mp[i])
-            {
-                first_diff_idx = i;
-                mark[b] = 1;
-                break;
-            }
-        }
-
-        if (mark[b])
-        {
-            uint32_t diff_abs = s + (uint32_t)first_diff_idx;
-            uint32_t win = 8;
-            uint32_t w_lo = (first_diff_idx > win) ? (first_diff_idx - win) : 0;
-            uint32_t w_hi = ((first_diff_idx + win) < cmp_len) ? (first_diff_idx + win) : (cmp_len - 1);
-
-            char img_hex[3 * 17] = {0}, dev_hex[3 * 17] = {0};
-            unsigned k = 0;
-            for (uint32_t j = w_lo; j <= w_hi && k < 16; ++j, ++k)
-            {
-                if (bp[j] != 0xFF)
-                {
-                    snprintf(img_hex + strlen(img_hex), sizeof(img_hex) - strlen(img_hex), "%02X ", bp[j]);
-                    snprintf(dev_hex + strlen(dev_hex), sizeof(dev_hex) - strlen(dev_hex), "%02X ", mp[j]);
-                }
-                else
-                {
-                    snprintf(img_hex + strlen(img_hex), sizeof(img_hex) - strlen(img_hex), ".. ");
-                    snprintf(dev_hex + strlen(dev_hex), sizeof(dev_hex) - strlen(dev_hex), ".. ");
-                }
-            }
-
-            LOG_DEBUG(LOG_PREFIX
-                      ": prescan: block %u need_upd (range=[0x%08x..0x%08x], first_diff=0x%08x, img/dev[%uB]: %s | %s)",
-                      (unsigned)b, (unsigned)s, (unsigned)(e - 1),
-                      (unsigned)diff_abs, (unsigned)k, img_hex, dev_hex);
-        }
-    }
-
-    free(cur);
-    return ERROR_OK;
-}
-
-// Segment processing: enter P/E once, within segment erase per block → continuous programming → exit P/E at segment end
-static int ra2l1_process_segment(struct flash_bank *bank,
-                                 uint32_t seg_blk_first, uint32_t seg_blk_last,
-                                 const uint8_t *buf, uint32_t offset, uint32_t count)
-{
-    struct target *t = bank->target;
-    struct ra2l1_flash_bank *info = bank->driver_priv;
-    const uint32_t blk = info->is_data ? 1024u : 2048u;
-
-    int r = ra2l1_enter_pe(t, info->is_data);
-    if (r)
-        return r;
-
-    for (uint32_t b = seg_blk_first; b <= seg_blk_last; ++b)
-    {
-        uint32_t b_off = b * blk;
-        uint32_t pe_base = ra2l1_to_pe_addr(bank, b_off);
-
-        r = ra2l1_block_erase(bank, pe_base);
-        if (r)
-        {
-            ra2l1_exit_pe(t);
-            return r;
-        }
-        ra2l1_seq_sync(t);
-
-        uint32_t s = (b_off < offset) ? offset : b_off;
-        uint32_t e = ((b_off + blk) > (offset + count)) ? (offset + count) : (b_off + blk);
-        uint32_t len = (e > s) ? (e - s) : 0;
-        if (len == 0)
-            continue;
-
-        const uint8_t *bp = buf + (s - offset);
-
-        if (info->is_data)
-        {
-            for (uint32_t i = 0; i < len; ++i)
-            {
-                uint8_t v = bp[i];
-                if (v == 0xFF)
-                    continue;
-                uint32_t pe_addr = ra2l1_to_pe_addr(bank, s + i);
-                r = ra2l1_program(bank, pe_addr, &v, 1);
-                if (r)
-                {
-                    ra2l1_exit_pe(t);
-                    return r;
-                }
-            }
-        }
-        else
-        {
-            uint32_t i = 0;
-            while (i < len)
-            {
-                uint32_t rem = len - i;
-                uint8_t tmp[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-                uint32_t step = (rem >= 4) ? 4 : rem;
-                memcpy(tmp, bp + i, step);
-
-                uint32_t w = ((uint32_t)tmp[0]) |
-                             ((uint32_t)tmp[1] << 8) |
-                             ((uint32_t)tmp[2] << 16) |
-                             ((uint32_t)tmp[3] << 24);
-
-                if (w != 0xFFFFFFFFu)
-                {
-                    uint32_t pe_addr = ra2l1_to_pe_addr(bank, s + i);
-
-                    if ((pe_addr & 0x3u) != 0)
-                    {
-                        LOG_ERROR(LOG_PREFIX ": unaligned program addr 0x%08x (s=0x%08x i=0x%08x)",
-                                  pe_addr, (unsigned)s, (unsigned)i);
-                        ra2l1_exit_pe(t);
-                        return ERROR_FAIL;
-                    }
-
-                    int rr = ra2l1_program(bank, pe_addr, tmp, 4);
-                    if (rr)
-                    {
-                        ra2l1_exit_pe(t);
-                        return rr;
-                    }
-                }
-
-                i += step;
-            }
-
-            r = ra2l1_seq_sync(t);
-            if (r)
-            {
-                ra2l1_exit_pe(t);
-                return r;
-            }
-        }
-    }
-
-    return ra2l1_exit_pe(t);
-}
-
-// Scan result summary output (for debugging)
-static void ra2l1_debug_dump_scan(const struct flash_bank *bank,
-                                  const uint8_t *mark,
-                                  uint32_t first_blk, uint32_t last_blk,
-                                  uint32_t blk_sz, uint32_t write_off, uint32_t write_cnt)
-{
-    uint32_t total_blks = last_blk - first_blk + 1;
-    uint32_t need_upd = 0, same_cnt = 0;
-    for (uint32_t b = first_blk; b <= last_blk; ++b)
-    {
-        if (mark[b])
-            need_upd++;
-        else
-            same_cnt++;
-    }
-
-    LOG_INFO(LOG_PREFIX ": prescan: base=0x%08x, write_off=0x%08x, write_cnt=0x%08x, blk_sz=%u, blocks=[%u..%u], total=%u, need_upd=%u, same=%u",
-             (unsigned)bank->base, (unsigned)write_off, (unsigned)write_cnt,
-             (unsigned)blk_sz, (unsigned)first_blk, (unsigned)last_blk,
-             (unsigned)total_blks, (unsigned)need_upd, (unsigned)same_cnt);
-
-    const uint32_t MAX_SEG_PRINT = 32;
-    uint32_t seg_printed = 0;
-
-    uint32_t b = first_blk;
-    while (b <= last_blk)
-    {
-        while (b <= last_blk && mark[b] == 0)
-            b++;
-        if (b > last_blk)
-            break;
-        uint32_t seg_first = b;
-        while (b <= last_blk && mark[b] == 1)
-            b++;
-        uint32_t seg_last = b - 1;
-
-        if (seg_printed < MAX_SEG_PRINT)
-        {
-            uint32_t off0 = seg_first * blk_sz;
-            uint32_t off1 = (seg_last + 1) * blk_sz - 1;
-            uint32_t len = (seg_last - seg_first + 1) * blk_sz;
-            LOG_DEBUG(LOG_PREFIX ": prescan seg[%u]: blocks=[%u..%u], off=[0x%08x..0x%08x], len=0x%08x",
-                      (unsigned)seg_printed, (unsigned)seg_first, (unsigned)seg_last,
-                      (unsigned)off0, (unsigned)off1, (unsigned)len);
-        }
-        seg_printed++;
-    }
-
-    if (seg_printed > MAX_SEG_PRINT)
-    {
-        LOG_INFO(LOG_PREFIX ": prescan: segments total=%u (printed first %u only)",
-                 (unsigned)seg_printed, (unsigned)MAX_SEG_PRINT);
-    }
-    else
-    {
-        LOG_INFO(LOG_PREFIX ": prescan: segments total=%u", (unsigned)seg_printed);
-    }
-}
-
-// Write: pre-scan into segments first, then process per segment; clock forced to MOCO 8MHz first
+/* ====== 对外：OpenOCD 写入口（替换 flash_driver 的 .write 回调） ====== */
 static int ra2l1_flash_write(struct flash_bank *bank,
-                             const uint8_t *buf,
-                             uint32_t offset,
-                             uint32_t count)
+			     const uint8_t *buffer,
+			     uint32_t offset,
+			     uint32_t count)
 {
-    struct target *t = bank->target;
-    struct ra2l1_flash_bank *info = bank->driver_priv;
-    if (t->state != TARGET_HALTED)
-        return ERROR_TARGET_NOT_HALTED;
+	if (count == 0)
+		return ERROR_OK;
 
-    // LOG_INFO(LOG_PREFIX ": write enter: base=0x%08x, offset=0x%08x, count=0x%08x, is_data=%d",
-    //          (unsigned)bank->base, (unsigned)offset, (unsigned)count, info->is_data ? 1 : 0);
+	struct target *target = bank->target;
+	int retval;
 
-    (void)ra2l1_force_moco(t);
+	/* 目标停机 */
+	retval = target_halt(target);
+	if (retval != ERROR_OK) return retval;
+	retval = target_wait_state(target, TARGET_HALTED, 1000);
+	if (retval != ERROR_OK) return retval;
 
-    uint32_t blk = info->is_data ? 1024u : 2048u;
-    uint32_t first_blk = offset / blk;
-    uint32_t last_blk = (offset + count - 1) / blk;
-    uint32_t num_blks = last_blk + 1;
+	/* 写入 stub 到固定地址（与链接脚本一致） */
+	if (ra2l1_stub_bin_len > RA2L1_STUB_SIZE) {
+		LOG_ERROR("RA2L1: stub too large (%u > %u)",
+		          ra2l1_stub_bin_len, RA2L1_STUB_SIZE);
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	}
+	retval = target_write_buffer(target, RA2L1_STUB_BASE,
+	                             ra2l1_stub_bin_len, ra2l1_stub_bin);
+	if (retval != ERROR_OK) {
+		LOG_ERROR("RA2L1: write stub @0x%08" PRIx32 " failed (%d)",
+		          (uint32_t)RA2L1_STUB_BASE, retval);
+		return retval;
+	}
 
-    LOG_DEBUG(LOG_PREFIX ": calc: blk_sz=%u, first_blk=%u, last_blk=%u, mark_slots=%u",
-             (unsigned)blk, (unsigned)first_blk, (unsigned)last_blk, (unsigned)num_blks);
+	/* 分片执行 stub：绝对地址 = bank->base + offset + off */
+	uint32_t off = 0;
+	while (off < count) {
+		uint32_t chunk = count - off;
+		if (chunk > RA2L1_CHUNK_MAX)
+			chunk = RA2L1_CHUNK_MAX;
 
-    uint8_t *mark = (uint8_t *)calloc(num_blks, 1);
-    if (!mark)
-    {
-        LOG_ERROR(LOG_PREFIX ": calloc(mark, %u) failed", (unsigned)num_blks);
-        return ERROR_FAIL;
-    }
+		uint32_t dst_abs = bank->base + offset + off;
 
-    int r = ra2l1_prescan_mark_blocks(bank, buf, offset, count, mark);
-    if (r)
-    {
-        LOG_ERROR(LOG_PREFIX ": prescan failed: %d", r);
-        free(mark);
-        return r;
-    }
+		retval = ra2l1_run_stub_chunk(target, dst_abs, buffer + off, chunk);
+		if (retval != ERROR_OK)
+			return retval;
 
-    ra2l1_debug_dump_scan(bank, mark, first_blk, last_blk, blk, offset, count);
+		off += chunk;
+	}
 
-    uint32_t b = first_blk;
-    uint32_t seg_idx = 0;
-    int overall_ret = ERROR_OK;
-
-    while (b <= last_blk)
-    {
-        while (b <= last_blk && mark[b] == 0)
-            b++;
-        if (b > last_blk)
-            break;
-
-        uint32_t seg_first = b;
-        while (b <= last_blk && mark[b] == 1)
-            b++;
-        uint32_t seg_last = b - 1;
-
-        uint32_t seg_off = seg_first * blk;
-        uint32_t seg_len = (seg_last - seg_first + 1) * blk;
-        uint32_t seg_end = seg_off + seg_len - 1;
-
-        LOG_DEBUG(LOG_PREFIX ": SEG[%u] begin: blocks=[%u..%u], off=[0x%08x..0x%08x], len=0x%08x",
-                  (unsigned)seg_idx, (unsigned)seg_first, (unsigned)seg_last,
-                  (unsigned)seg_off, (unsigned)seg_end, (unsigned)seg_len);
-
-        int64_t t0 = timeval_ms();
-        r = ra2l1_process_segment(bank, seg_first, seg_last, buf, offset, count);
-        int64_t t1 = timeval_ms();
-
-        if (r != ERROR_OK)
-        {
-            LOG_ERROR(LOG_PREFIX ": SEG[%u] failed (r=%d): blocks=[%u..%u], off=[0x%08x..0x%08x]",
-                      (unsigned)seg_idx, r, (unsigned)seg_first, (unsigned)seg_last,
-                      (unsigned)seg_off, (unsigned)seg_end);
-            overall_ret = r;
-            break;
-        }
-
-        LOG_DEBUG(LOG_PREFIX ": SEG[%u] done: elapsed=%lld ms",
-                  (unsigned)seg_idx, (long long)(t1 - t0));
-
-        LOG_INFO(LOG_PREFIX ": SEG[%u] blocks=[%u..%u] elapsed=%lld ms",
-                 (unsigned)seg_idx, (unsigned)seg_first, (unsigned)seg_last, (long long)(t1 - t0));
-
-        seg_idx++;
-    }
-
-    free(mark);
-
-    if (overall_ret == ERROR_OK)
-    {
-        LOG_DEBUG(LOG_PREFIX ": write exit: OK (segments=%u)", (unsigned)seg_idx);
-    }
-    else
-    {
-        LOG_ERROR(LOG_PREFIX ": write exit: ERR=%d (processed_segments=%u)", overall_ret, (unsigned)seg_idx);
-    }
-
-    return overall_ret;
+	return ERROR_OK;
 }
+
 
 // Read
 static int ra2l1_flash_read(struct flash_bank *bank, uint8_t *readbuf,
