@@ -314,5 +314,6 @@ extern const struct flash_driver xcf_flash;
 extern const struct flash_driver xmc1xxx_flash;
 extern const struct flash_driver xmc4xxx_flash;
 extern const struct flash_driver ra2l1_flash;
+extern const struct flash_driver firert_flash;
 
 #endif /* OPENOCD_FLASH_NOR_DRIVER_H */

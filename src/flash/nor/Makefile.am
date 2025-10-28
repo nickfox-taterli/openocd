@@ -84,7 +84,8 @@ NOR_DRIVERS = \
 	%D%/xcf.c \
 	%D%/xmc1xxx.c \
 	%D%/xmc4xxx.c \
-	%D%/renesas_ra2l1.c
+	%D%/renesas_ra2l1.c \
+	%D%/firert.c
 
 NORHEADERS = \
 	%D%/artery.h \
