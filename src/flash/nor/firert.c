@@ -1447,6 +1447,20 @@ static int firert_stub_run(struct target *target)
 
     target_resume(target, 0 /* current addr unused */, (pc & ~1u) /* entry */, 1, 1);
 
+    int rv = target_wait_state(target, TARGET_HALTED, /*ms*/2000);
+    if (rv == ERROR_TIMEOUT_REACHED) {
+        alive_sleep(2000);              /* 这是 OpenOCD 自带的 sleep */
+        (void)target_halt(target);
+        rv = target_wait_state(target, TARGET_HALTED, /*ms*/2000);
+        if (rv != ERROR_OK) return rv;
+    } else if (rv != ERROR_OK) {
+        return rv;
+    }
+
+    /* 同步一次内部状态机 */
+    rv = target_poll(target);
+    if (rv != ERROR_OK) return rv;
+
     /* 清理 */
     for (int i = 0; i < nregs; i++) destroy_reg_param(&regs[i]);
 
