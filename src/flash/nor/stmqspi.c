@@ -173,6 +173,64 @@ struct stmqspi_flash_bank {
 	unsigned int sfdp_dummy2;	/* number of dummy bytes for SFDP read for flash2 */
 };
 
+/*
+ * Some probe/targets are unreliable for byte accesses on OCTOSPI_DR (offset 0x50).
+ * Use 32-bit accesses for OCTOSPI and extract/inject low byte.
+ */
+static inline int stmqspi_dr_read8(struct flash_bank *bank, uint8_t *data)
+{
+	struct target *target = bank->target;
+	const struct stmqspi_flash_bank *stmqspi_info = bank->driver_priv;
+	const uint32_t io_base = stmqspi_info->io_base;
+	long long endtime = timeval_ms() + SPI_CMD_TIMEOUT;
+	bool ready = false;
+	uint32_t last_sr = 0;
+
+	/* Wait until RX FIFO has at least one byte. */
+	do {
+		uint32_t sr;
+		int retval = target_read_u32(target, io_base + (stmqspi_info->octo ? OCTOSPI_SR : QSPI_SR), &sr);
+		if (retval != ERROR_OK)
+			return retval;
+		last_sr = sr;
+		/* On some STM32H7R/XSPI states, 1-byte reads complete with TCF set
+		 * while FTF stays clear. Accept either flag before draining DR. */
+		if (sr & (BIT(SPI_FTF) | BIT(SPI_TCF))) {
+			ready = true;
+			break;
+		}
+		alive_sleep(1);
+	} while (timeval_ms() < endtime);
+
+	if (!ready) {
+		LOG_DEBUG("timeout waiting DR data (SR=0x%08" PRIx32 ")", last_sr);
+		return ERROR_TIMEOUT_REACHED;
+	}
+
+	if (stmqspi_info->octo) {
+		uint32_t v;
+		int retval = target_read_u32(target, io_base + OCTOSPI_DR, &v);
+		if (retval != ERROR_OK)
+			return retval;
+		*data = (uint8_t)(v & 0xFFU);
+		return ERROR_OK;
+	}
+
+	return target_read_u8(target, io_base + QSPI_DR, data);
+}
+
+static inline int stmqspi_dr_write8(struct flash_bank *bank, uint8_t data)
+{
+	struct target *target = bank->target;
+	const struct stmqspi_flash_bank *stmqspi_info = bank->driver_priv;
+	const uint32_t io_base = stmqspi_info->io_base;
+
+	if (stmqspi_info->octo)
+		return target_write_u32(target, io_base + OCTOSPI_DR, (uint32_t)data);
+
+	return target_write_u8(target, io_base + QSPI_DR, data);
+}
+
 static inline int octospi_cmd(struct flash_bank *bank, uint32_t mode,
 		uint32_t ccr, uint32_t ir)
 {
@@ -264,11 +322,20 @@ static int stmqspi_abort(struct flash_bank *bank)
 	const struct stmqspi_flash_bank *stmqspi_info = bank->driver_priv;
 	const uint32_t io_base = stmqspi_info->io_base;
 	uint32_t cr;
+	uint32_t sr;
+	int retval;
 
-	int retval = target_read_u32(target, io_base + SPI_CR, &cr);
+	retval = target_read_u32(target, io_base + SPI_CR, &cr);
 
 	if (retval != ERROR_OK)
 		cr = 0;
+
+	/* H7RS: avoid asserting ABORT while controller is already idle.
+	 * Forcing ABORT on idle can wedge BUSY in some states. */
+	retval = target_read_u32(target,
+		io_base + (stmqspi_info->octo ? OCTOSPI_SR : QSPI_SR), &sr);
+	if (retval == ERROR_OK && (sr & BIT(SPI_BUSY)) == 0)
+		return ERROR_OK;
 
 	return target_write_u32(target, io_base + SPI_CR, cr | BIT(SPI_ABORT));
 }
@@ -370,7 +437,7 @@ static int read_status_reg(struct flash_bank *bank, uint16_t *status)
 		if ((stmqspi_info->saved_cr & (BIT(SPI_DUAL_FLASH) | BIT(SPI_FSEL_FLASH)))
 			!= BIT(SPI_FSEL_FLASH)) {
 			/* get status of flash 1 in dual mode or flash 1 only mode */
-			retval = target_read_u8(target, io_base + SPI_DR, &data);
+			retval = stmqspi_dr_read8(bank, &data);
 			if (retval != ERROR_OK)
 				goto err;
 			*status |= data;
@@ -378,7 +445,7 @@ static int read_status_reg(struct flash_bank *bank, uint16_t *status)
 
 		if ((stmqspi_info->saved_cr & (BIT(SPI_DUAL_FLASH) | BIT(SPI_FSEL_FLASH))) != 0) {
 			/* get status of flash 2 in dual mode or flash 2 only mode */
-			retval = target_read_u8(target, io_base + SPI_DR, &data);
+			retval = stmqspi_dr_read8(bank, &data);
 			if (retval != ERROR_OK)
 				goto err;
 			*status |= ((uint16_t)data) << 8;
@@ -862,7 +929,7 @@ COMMAND_HANDLER(stmqspi_handle_cmd)
 		for (count = 3; count < CMD_ARGC; count++) {
 			COMMAND_PARSE_NUMBER(u8, CMD_ARGV[count], data);
 			snprintf(temp, sizeof(temp), "%02" PRIx8 " ", data);
-			retval = target_write_u8(target, io_base + SPI_DR, data);
+			retval = stmqspi_dr_write8(bank, data);
 			if (retval != ERROR_OK)
 				goto err;
 			strncat(output, temp, sizeof(output) - strlen(output) - 1);
@@ -905,7 +972,7 @@ COMMAND_HANDLER(stmqspi_handle_cmd)
 
 		/* read response bytes */
 		for ( ; num_read > 0; num_read--) {
-			retval = target_read_u8(target, io_base + SPI_DR, &data);
+			retval = stmqspi_dr_read8(bank, &data);
 			if (retval != ERROR_OK)
 				goto err;
 			snprintf(temp, sizeof(temp), "%02" PRIx8 " ", data);
@@ -1769,12 +1836,12 @@ static int find_sfdp_dummy(struct flash_bank *bank, int len)
 	for (count = 0 ; count < max_bytes; count++) {
 		if ((dual != 0) && !flash1) {
 			/* discard even byte in dual flash-mode if flash2 */
-			retval = target_read_u8(target, io_base + SPI_DR, &data);
+			retval = stmqspi_dr_read8(bank, &data);
 			if (retval != ERROR_OK)
 				goto err;
 		}
 
-		retval = target_read_u8(target, io_base + SPI_DR, &data);
+		retval = stmqspi_dr_read8(bank, &data);
 		if (retval != ERROR_OK)
 			goto err;
 
@@ -1790,7 +1857,7 @@ static int find_sfdp_dummy(struct flash_bank *bank, int len)
 
 		if ((dual != 0) && flash1) {
 			/* discard odd byte in dual flash-mode if flash1 */
-			retval = target_read_u8(target, io_base + SPI_DR, &data);
+			retval = stmqspi_dr_read8(bank, &data);
 			if (retval != ERROR_OK)
 				goto err;
 		}
@@ -1888,7 +1955,7 @@ static int read_sfdp_block(struct flash_bank *bank, uint32_t addr,
 
 	/* dummy clocks */
 	for (count = *dummy << dual; count > 0; --count) {
-		retval = target_read_u8(target, io_base + SPI_DR, (uint8_t *)buffer);
+		retval = stmqspi_dr_read8(bank, (uint8_t *)buffer);
 		if (retval != ERROR_OK)
 			goto err;
 	}
@@ -2016,7 +2083,7 @@ static int read_flash_id(struct flash_bank *bank, uint32_t *id1, uint32_t *id2)
 		for (len1 = 0, len2 = 0; count > 0; --count) {
 			if ((stmqspi_info->saved_cr & (BIT(SPI_DUAL_FLASH) |
 				BIT(SPI_FSEL_FLASH))) != BIT(SPI_FSEL_FLASH)) {
-				retval = target_read_u8(target, io_base + SPI_DR, &byte);
+				retval = stmqspi_dr_read8(bank, &byte);
 				if (retval != ERROR_OK)
 					goto err;
 				/* collect 3 bytes without continuation codes */
@@ -2027,7 +2094,7 @@ static int read_flash_id(struct flash_bank *bank, uint32_t *id1, uint32_t *id2)
 			}
 			if ((stmqspi_info->saved_cr & (BIT(SPI_DUAL_FLASH) |
 				BIT(SPI_FSEL_FLASH))) != 0) {
-				retval = target_read_u8(target, io_base + SPI_DR, &byte);
+				retval = stmqspi_dr_read8(bank, &byte);
 				if (retval != ERROR_OK)
 					goto err;
 				/* collect 3 bytes without continuation codes */
@@ -2369,8 +2436,8 @@ static int stmqspi_auto_probe(struct flash_bank *bank)
 
 	if (stmqspi_info->probed)
 		return ERROR_OK;
-	stmqspi_probe(bank);
-	return ERROR_OK;
+
+	return stmqspi_probe(bank);
 }
 
 static int stmqspi_protect_check(struct flash_bank *bank)
