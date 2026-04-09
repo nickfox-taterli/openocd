@@ -39,6 +39,8 @@ struct ra2l1_flash_bank {
 	uint32_t pe_base;
 };
 
+static bool ra2l1_fallback_write_logged;
+
 static int ra2l1_unlock_prcr(struct target *target)
 {
 	return target_write_u16(target, RA2L1_REG_PRCR,
@@ -454,8 +456,13 @@ static int ra2l1_write(struct flash_bank *bank, const uint8_t *buffer,
 	{
 		uint32_t unit_count = aligned_count / info->program_unit;
 		retval = ra2l1_write_block(bank, buffer, offset, unit_count);
-		if (retval == ERROR_TARGET_RESOURCE_NOT_AVAILABLE)
+		if (retval == ERROR_TARGET_RESOURCE_NOT_AVAILABLE) {
+			if (!ra2l1_fallback_write_logged) {
+				LOG_WARNING("RA2L1: fallback to slow DAP write path");
+				ra2l1_fallback_write_logged = true;
+			}
 			retval = ra2l1_write_block_without_loader(bank, buffer, offset, unit_count);
+		}
 	}
 
 	{
