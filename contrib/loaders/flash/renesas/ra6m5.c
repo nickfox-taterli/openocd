@@ -9,6 +9,7 @@ static inline __attribute__((always_inline))
 void program_one_unit(uint32_t program_unit, uint32_t target_address, const uint8_t *src)
 {
 	volatile uint32_t *fsaddr = (volatile uint32_t *)RA6M5_REG_FSADDR;
+	volatile uint32_t *fstatr = (volatile uint32_t *)RA6M5_REG_FSTATR;
 	volatile uint8_t *faci_cmd = (volatile uint8_t *)RA6M5_FACI_CMD_AREA;
 	volatile uint16_t *faci_data = (volatile uint16_t *)RA6M5_FACI_CMD_AREA;
 
@@ -19,6 +20,8 @@ void program_one_unit(uint32_t program_unit, uint32_t target_address, const uint
 	for (uint32_t i = 0; i < program_unit; i += 2) {
 		uint16_t v = (uint16_t)src[i] | ((uint16_t)src[i + 1] << 8);
 		*faci_data = v;
+		while ((*fstatr & RA6M5_FSTATR_DBFULL) != 0)
+			;
 	}
 
 	*faci_cmd = RA6M5_FACI_CMD_EXECUTE;

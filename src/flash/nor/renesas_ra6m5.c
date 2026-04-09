@@ -26,6 +26,9 @@ struct ra6m5_flash_bank {
 	bool probed;
 	bool is_data_flash;
 	uint32_t program_unit;
+	bool cache_saved;
+	uint16_t saved_fcachee;
+	uint32_t saved_ccactl;
 };
 
 static bool ra6m5_fallback_write_logged;
@@ -47,6 +50,24 @@ static int ra6m5_wait_frdy(struct target *target, unsigned int timeout_ms)
 	return ERROR_TIMEOUT_REACHED;
 }
 
+static int ra6m5_wait_dbfull_clear(struct target *target)
+{
+	/* DBFULL should deassert quickly; bound loop to avoid indefinite hangs. */
+	uint32_t timeout = 2000;
+
+	while (timeout--) {
+		uint32_t fstatr;
+		int retval = target_read_u32(target, RA6M5_REG_FSTATR, &fstatr);
+		if (retval != ERROR_OK)
+			return retval;
+
+		if ((fstatr & RA6M5_FSTATR_DBFULL) == 0)
+			return ERROR_OK;
+	}
+
+	return ERROR_TIMEOUT_REACHED;
+}
+
 static int ra6m5_status_clear(struct target *target)
 {
 	return target_write_u8(target, RA6M5_FACI_CMD_AREA, RA6M5_FACI_CMD_STATUS_CLEAR);
@@ -55,8 +76,18 @@ static int ra6m5_status_clear(struct target *target)
 static int ra6m5_check_errors_common(struct target *target, bool log_error)
 {
 	uint32_t fstatr;
+	uint32_t feaddr;
+	uint16_t fcmdr;
 	uint8_t fastat;
 	int retval = target_read_u32(target, RA6M5_REG_FSTATR, &fstatr);
+	if (retval != ERROR_OK)
+		return retval;
+
+	retval = target_read_u32(target, RA6M5_REG_FEADDR, &feaddr);
+	if (retval != ERROR_OK)
+		return retval;
+
+	retval = target_read_u16(target, RA6M5_REG_FCMDR, &fcmdr);
 	if (retval != ERROR_OK)
 		return retval;
 
@@ -68,8 +99,9 @@ static int ra6m5_check_errors_common(struct target *target, bool log_error)
 		return ERROR_OK;
 
 	if (log_error) {
-		LOG_ERROR("RA6M5 flash status error: FSTATR=0x%08" PRIx32 ", FASTAT=0x%02" PRIx8,
-				fstatr, fastat);
+		LOG_ERROR("RA6M5 flash status error: FSTATR=0x%08" PRIx32 ", FASTAT=0x%02" PRIx8
+				", FCMDR=0x%04" PRIx16 ", FEADDR=0x%08" PRIx32,
+				fstatr, fastat, fcmdr, feaddr);
 	}
 
 	retval = ra6m5_status_clear(target);
@@ -94,6 +126,30 @@ static int ra6m5_enable_pe_common(struct flash_bank *bank, bool log_error)
 	struct target *target = bank->target;
 	int retval;
 
+	if (!info->is_data_flash && !info->cache_saved) {
+		retval = target_read_u16(target, RA6M5_REG_FCACHEE, &info->saved_fcachee);
+		if (retval != ERROR_OK)
+			return retval;
+		retval = target_read_u32(target, RA6M5_REG_CC_ACTL, &info->saved_ccactl);
+		if (retval != ERROR_OK)
+			return retval;
+
+		/* FSP disables flash/I-cache before Code Flash P/E to avoid illegal access. */
+		retval = target_write_u16(target, RA6M5_REG_FCACHEE, 0);
+		if (retval != ERROR_OK)
+			return retval;
+		retval = target_write_u32(target, RA6M5_REG_CC_ACTL, 0);
+		if (retval != ERROR_OK)
+			return retval;
+		info->cache_saved = true;
+	}
+
+	if (!info->is_data_flash) {
+		retval = target_write_u16(target, RA6M5_REG_FMEPROT, RA6M5_FMEPROT_UNLOCK);
+		if (retval != ERROR_OK)
+			return retval;
+	}
+
 	retval = target_write_u8(target, RA6M5_REG_FWEPROR, RA6M5_FWEPROR_ENABLE);
 	if (retval != ERROR_OK)
 		return retval;
@@ -115,8 +171,10 @@ static int ra6m5_enable_pe(struct flash_bank *bank)
 	return ra6m5_enable_pe_common(bank, true);
 }
 
-static int ra6m5_disable_pe(struct target *target)
+static int ra6m5_disable_pe(struct flash_bank *bank)
 {
+	struct target *target = bank->target;
+	struct ra6m5_flash_bank *info = bank->driver_priv;
 	int retval;
 
 	retval = target_write_u16(target, RA6M5_REG_FENTRYR, RA6M5_FENTRYR_READ);
@@ -126,6 +184,22 @@ static int ra6m5_disable_pe(struct target *target)
 	retval = target_write_u8(target, RA6M5_REG_FWEPROR, RA6M5_FWEPROR_DISABLE);
 	if (retval != ERROR_OK)
 		return retval;
+
+	if (!info->is_data_flash) {
+		retval = target_write_u16(target, RA6M5_REG_FMEPROT, RA6M5_FMEPROT_LOCK);
+		if (retval != ERROR_OK)
+			return retval;
+	}
+
+	if (!info->is_data_flash && info->cache_saved) {
+		retval = target_write_u32(target, RA6M5_REG_CC_ACTL, info->saved_ccactl);
+		if (retval != ERROR_OK)
+			return retval;
+		retval = target_write_u16(target, RA6M5_REG_FCACHEE, info->saved_fcachee);
+		if (retval != ERROR_OK)
+			return retval;
+		info->cache_saved = false;
+	}
 
 	return ERROR_OK;
 }
@@ -151,6 +225,10 @@ static int ra6m5_program_one_unit(struct flash_bank *bank, uint32_t addr, const 
 	for (uint32_t i = 0; i < info->program_unit; i += 2) {
 		uint16_t v = (uint16_t)buffer[i] | ((uint16_t)buffer[i + 1] << 8);
 		retval = target_write_u16(target, RA6M5_FACI_CMD_AREA, v);
+		if (retval != ERROR_OK)
+			return retval;
+
+		retval = ra6m5_wait_dbfull_clear(target);
 		if (retval != ERROR_OK)
 			return retval;
 	}
@@ -480,7 +558,7 @@ static int ra6m5_erase(struct flash_bank *bank, unsigned int first, unsigned int
 
 done:
 	{
-		int retval2 = ra6m5_disable_pe(target);
+		int retval2 = ra6m5_disable_pe(bank);
 		if (retval == ERROR_OK)
 			retval = retval2;
 	}
@@ -536,7 +614,19 @@ static int ra6m5_write(struct flash_bank *bank, const uint8_t *buffer, uint32_t 
 		else
 			retval = ra6m5_write_block_sync(bank, buffer, offset, unit_count);
 		if (retval == ERROR_FLASH_OPERATION_FAILED) {
-			int retval2 = ra6m5_disable_pe(target);
+			uint32_t fstatr = 0;
+			uint32_t feaddr = 0;
+			uint16_t fcmdr = 0;
+			uint8_t fastat = 0;
+			(void)target_read_u32(target, RA6M5_REG_FSTATR, &fstatr);
+			(void)target_read_u8(target, RA6M5_REG_FASTAT, &fastat);
+			(void)target_read_u16(target, RA6M5_REG_FCMDR, &fcmdr);
+			(void)target_read_u32(target, RA6M5_REG_FEADDR, &feaddr);
+			LOG_ERROR("RA6M5 loader write failed: FSTATR=0x%08" PRIx32 ", FASTAT=0x%02" PRIx8
+					", FCMDR=0x%04" PRIx16 ", FEADDR=0x%08" PRIx32,
+					fstatr, fastat, fcmdr, feaddr);
+
+			int retval2 = ra6m5_disable_pe(bank);
 			if (retval2 == ERROR_OK)
 				retval2 = ra6m5_enable_pe_common(bank, false);
 			if (retval2 != ERROR_OK)
@@ -553,7 +643,7 @@ static int ra6m5_write(struct flash_bank *bank, const uint8_t *buffer, uint32_t 
 	}
 
 	{
-		int retval2 = ra6m5_disable_pe(target);
+		int retval2 = ra6m5_disable_pe(bank);
 		if (retval == ERROR_OK)
 			retval = retval2;
 	}

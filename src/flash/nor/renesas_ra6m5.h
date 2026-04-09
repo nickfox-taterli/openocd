@@ -20,13 +20,17 @@
 #define RA6M5_DATA_PROGRAM_UNIT      4u
 
 #define RA6M5_REG_FWEPROR            0x4001E416u
+#define RA6M5_REG_CC_ACTL            0x40007000u
+#define RA6M5_REG_FCACHEE            0x4001C100u
 
 #define RA6M5_FACI_BASE              0x407FE000u
 #define RA6M5_REG_FASTAT             (RA6M5_FACI_BASE + 0x0010u)
 #define RA6M5_REG_FSADDR             (RA6M5_FACI_BASE + 0x0030u)
 #define RA6M5_REG_FEADDR             (RA6M5_FACI_BASE + 0x0034u)
+#define RA6M5_REG_FMEPROT            (RA6M5_FACI_BASE + 0x0044u)
 #define RA6M5_REG_FSTATR             (RA6M5_FACI_BASE + 0x0080u)
 #define RA6M5_REG_FENTRYR            (RA6M5_FACI_BASE + 0x0084u)
+#define RA6M5_REG_FCMDR              (RA6M5_FACI_BASE + 0x00A0u)
 
 #define RA6M5_FACI_CMD_AREA          0x407E0000u
 
@@ -36,8 +40,11 @@
 
 #define RA6M5_FWEPROR_ENABLE         0x01u
 #define RA6M5_FWEPROR_DISABLE        0x02u
+#define RA6M5_FMEPROT_UNLOCK         0xD900u
+#define RA6M5_FMEPROT_LOCK           0xD901u
 
 #define RA6M5_FASTAT_CMDLK           BIT(4)
+#define RA6M5_FSTATR_DBFULL          BIT(10)
 #define RA6M5_FSTATR_FRDY            BIT(15)
 #define RA6M5_FSTATR_ERR_MASK        0x00F07000u
 
