@@ -58,6 +58,7 @@ NOR_DRIVERS = \
 	%D%/qn908x.c \
 	%D%/renesas_ra2l1.c \
 	%D%/renesas_ra6m5.c \
+	%D%/renesas_ra6m5_qspi.c \
 	%D%/renesas_rpchf.c \
 	%D%/rp2040.c \
 	%D%/rsl10.c \
@@ -98,6 +99,7 @@ NORHEADERS = \
 	%D%/ocl.h \
 	%D%/renesas_ra2l1.h \
 	%D%/renesas_ra6m5.h \
+	%D%/renesas_ra6m5_qspi.h \
 	%D%/sfdp.h \
 	%D%/spi.h \
 	%D%/stm32l4x.h \
