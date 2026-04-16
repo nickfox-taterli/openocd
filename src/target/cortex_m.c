@@ -2619,6 +2619,24 @@ int cortex_m_examine(struct target *target)
 			}
 		}
 
+		/* Some STAR-MC1 implementations report non-Arm implementor values.
+		 * Fallback to part-number based identification for this known case. */
+		if (!cortex_m->core_info &&
+				((cpuid & ARM_CPUID_PARTNO_MASK) == (STAR_MC1_PARTNO & ARM_CPUID_PARTNO_MASK))) {
+			for (unsigned int n = 0; n < ARRAY_SIZE(cortex_m_parts); n++) {
+				if (cortex_m_parts[n].impl_part == STAR_MC1_PARTNO) {
+					cortex_m->core_info = &cortex_m_parts[n];
+					LOG_TARGET_WARNING(target,
+							"Cortex-M CPUID implementor 0x%02" PRIx32
+							" with part 0x%03" PRIx32 " treated as %s",
+							(cpuid & ARM_CPUID_IMPLEMENTOR_MASK) >> ARM_CPUID_IMPLEMENTOR_POS,
+							(cpuid & ARM_CPUID_PARTNO_MASK) >> ARM_CPUID_PARTNO_POS,
+							cortex_m->core_info->name);
+					break;
+				}
+			}
+		}
+
 		if (!cortex_m->core_info) {
 			LOG_TARGET_ERROR(target, "Cortex-M CPUID: 0x%x is unrecognized", cpuid);
 			return ERROR_FAIL;

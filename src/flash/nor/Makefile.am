@@ -82,6 +82,8 @@ NOR_DRIVERS = \
 	%D%/str9x.c \
 	%D%/str9xpec.c \
 	%D%/swm050.c \
+	%D%/swm341.c \
+	%D%/swm341_sfc.c \
 	%D%/tms470.c \
 	%D%/virtual.c \
 	%D%/w600.c \
@@ -108,4 +110,6 @@ NORHEADERS = \
 	%D%/spi.h \
 	%D%/stm32l4x.h \
 	%D%/stmqspi.h \
-	%D%/msp432.h
+	%D%/msp432.h \
+	%D%/swm341.h \
+	%D%/swm341_sfc.h
