@@ -11,7 +11,10 @@
 #include "imp.h"
 
 #include <helper/align.h>
+#include <helper/binarybuffer.h>
 #include <helper/time_support.h>
+#include <target/algorithm.h>
+#include <target/armv7m.h>
 
 #include "renesas_ra8d1.h"
 
@@ -26,6 +29,8 @@ struct ra8d1_flash_bank {
 	bool cache_saved;
 	uint16_t saved_fcachee;
 };
+
+static bool ra8d1_fallback_write_logged;
 
 static int ra8d1_wait_frdy(struct target *target, unsigned int timeout_ms)
 {
@@ -217,13 +222,243 @@ static int ra8d1_program_one_unit(struct flash_bank *bank, uint32_t addr, const 
 	return ra8d1_check_errors(target, true);
 }
 
-static int ra8d1_write_slow(struct flash_bank *bank, const uint8_t *buffer, uint32_t offset, uint32_t count)
+static int ra8d1_write_block_async(struct flash_bank *bank, const uint8_t *buffer,
+		uint32_t offset, uint32_t count)
+{
+	struct ra8d1_flash_bank *info = bank->driver_priv;
+	struct target *target = bank->target;
+	struct working_area *write_algorithm;
+	struct working_area *source;
+	struct reg_param reg_params[5];
+	struct armv7m_algorithm armv7m_info;
+	int retval;
+	uint32_t target_address = bank->base + offset;
+
+	static const uint8_t ra8d1_flash_write_code[] = {
+#include "../../../contrib/loaders/flash/renesas/ra8d1.inc"
+	};
+
+	if (target_alloc_working_area(target, sizeof(ra8d1_flash_write_code),
+			&write_algorithm) != ERROR_OK)
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+
+	retval = target_write_buffer(target, write_algorithm->address,
+			sizeof(ra8d1_flash_write_code), ra8d1_flash_write_code);
+	if (retval != ERROR_OK) {
+		target_free_working_area(target, write_algorithm);
+		return retval;
+	}
+
+	const size_t extra_size = sizeof(struct ra8d1_loader_work_area);
+	uint32_t buffer_size = target_get_working_area_avail(target) - extra_size;
+	buffer_size &= ~(info->program_unit - 1);
+
+	if (buffer_size < 256) {
+		target_free_working_area(target, write_algorithm);
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	} else if (buffer_size > 16384) {
+		buffer_size = 16384;
+	}
+
+	if (target_alloc_working_area_try(target, buffer_size + extra_size, &source) != ERROR_OK) {
+		target_free_working_area(target, write_algorithm);
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	}
+
+	uint32_t program_unit_buf;
+	target_buffer_set_u32(target, (uint8_t *)&program_unit_buf, info->program_unit);
+	retval = target_write_buffer(target, source->address +
+			offsetof(struct ra8d1_loader_work_area, program_unit),
+			sizeof(program_unit_buf), (uint8_t *)&program_unit_buf);
+	if (retval != ERROR_OK)
+		goto cleanup;
+
+	memset(&armv7m_info, 0, sizeof(armv7m_info));
+	armv7m_info.common_magic = ARMV7M_COMMON_MAGIC;
+	armv7m_info.core_mode = ARM_MODE_THREAD;
+
+	init_reg_param(&reg_params[0], "r0", 32, PARAM_IN_OUT);
+	init_reg_param(&reg_params[1], "r1", 32, PARAM_OUT);
+	init_reg_param(&reg_params[2], "r2", 32, PARAM_OUT);
+	init_reg_param(&reg_params[3], "r3", 32, PARAM_OUT);
+	init_reg_param(&reg_params[4], "sp", 32, PARAM_OUT);
+
+	buf_set_u32(reg_params[0].value, 0, 32, source->address);
+	buf_set_u32(reg_params[1].value, 0, 32, source->address + source->size);
+	buf_set_u32(reg_params[2].value, 0, 32, target_address);
+	buf_set_u32(reg_params[3].value, 0, 32, count);
+	buf_set_u32(reg_params[4].value, 0, 32,
+			source->address + offsetof(struct ra8d1_loader_work_area, stack) + RA8D1_LOADER_STACK_SIZE);
+
+	retval = target_run_flash_async_algorithm(target, buffer, count, info->program_unit,
+			0, NULL,
+			ARRAY_SIZE(reg_params), reg_params,
+			source->address + offsetof(struct ra8d1_loader_work_area, fifo),
+			source->size - offsetof(struct ra8d1_loader_work_area, fifo),
+			write_algorithm->address, 0, &armv7m_info);
+
+	if (retval == ERROR_FLASH_OPERATION_FAILED) {
+		uint32_t fstatr = 0;
+		uint8_t fastat = 0;
+		(void)target_read_u32(target, RA8D1_REG_FSTATR, &fstatr);
+		(void)target_read_u8(target, RA8D1_REG_FASTAT, &fastat);
+		LOG_ERROR("error executing RA8D1 flash write algorithm");
+		LOG_ERROR("RA8D1 async write status: FSTATR=0x%08" PRIx32 ", FASTAT=0x%02" PRIx8,
+				fstatr, fastat);
+	}
+
+	destroy_reg_param(&reg_params[0]);
+	destroy_reg_param(&reg_params[1]);
+	destroy_reg_param(&reg_params[2]);
+	destroy_reg_param(&reg_params[3]);
+	destroy_reg_param(&reg_params[4]);
+
+cleanup:
+	target_free_working_area(target, source);
+	target_free_working_area(target, write_algorithm);
+	return retval;
+}
+
+static int ra8d1_write_block_sync(struct flash_bank *bank, const uint8_t *buffer,
+		uint32_t offset, uint32_t count)
+{
+	struct ra8d1_flash_bank *info = bank->driver_priv;
+	struct target *target = bank->target;
+	struct working_area *write_algorithm;
+	struct working_area *source;
+	struct reg_param reg_params[5];
+	struct armv7m_algorithm armv7m_info;
+	int retval;
+	uint32_t target_address = bank->base + offset;
+	uint32_t fifo_ctrl_address;
+	uint32_t fifo_data_address;
+	uint32_t fifo_data_size;
+	uint32_t stack_pointer;
+
+	static const uint8_t ra8d1_flash_write_code[] = {
+#include "../../../contrib/loaders/flash/renesas/ra8d1.inc"
+	};
+
+	if (target_alloc_working_area(target, sizeof(ra8d1_flash_write_code),
+			&write_algorithm) != ERROR_OK)
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+
+	retval = target_write_buffer(target, write_algorithm->address,
+			sizeof(ra8d1_flash_write_code), ra8d1_flash_write_code);
+	if (retval != ERROR_OK) {
+		target_free_working_area(target, write_algorithm);
+		return retval;
+	}
+
+	const size_t extra_size = sizeof(struct ra8d1_loader_work_area);
+	uint32_t buffer_size = target_get_working_area_avail(target) - extra_size;
+	buffer_size &= ~(info->program_unit - 1);
+
+	if (buffer_size < 256) {
+		target_free_working_area(target, write_algorithm);
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	} else if (buffer_size > 16384) {
+		buffer_size = 16384;
+	}
+
+	if (target_alloc_working_area_try(target, buffer_size + extra_size, &source) != ERROR_OK) {
+		target_free_working_area(target, write_algorithm);
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	}
+
+	uint32_t program_unit_buf;
+	target_buffer_set_u32(target, (uint8_t *)&program_unit_buf, info->program_unit);
+	retval = target_write_buffer(target, source->address +
+			offsetof(struct ra8d1_loader_work_area, program_unit),
+			sizeof(program_unit_buf), (uint8_t *)&program_unit_buf);
+	if (retval != ERROR_OK)
+		goto cleanup;
+
+	fifo_ctrl_address = source->address + offsetof(struct ra8d1_loader_work_area, fifo);
+	fifo_data_address = fifo_ctrl_address + 8;
+	fifo_data_size = source->size - offsetof(struct ra8d1_loader_work_area, fifo) - 8;
+	fifo_data_size &= ~(info->program_unit - 1);
+	stack_pointer = source->address + offsetof(struct ra8d1_loader_work_area, stack) + RA8D1_LOADER_STACK_SIZE;
+
+	if (fifo_data_size < info->program_unit) {
+		retval = ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+		goto cleanup;
+	}
+
+	memset(&armv7m_info, 0, sizeof(armv7m_info));
+	armv7m_info.common_magic = ARMV7M_COMMON_MAGIC;
+	armv7m_info.core_mode = ARM_MODE_THREAD;
+
+	init_reg_param(&reg_params[0], "r0", 32, PARAM_OUT);
+	init_reg_param(&reg_params[1], "r1", 32, PARAM_OUT);
+	init_reg_param(&reg_params[2], "r2", 32, PARAM_OUT);
+	init_reg_param(&reg_params[3], "r3", 32, PARAM_OUT);
+	init_reg_param(&reg_params[4], "sp", 32, PARAM_OUT);
+
+	while (count > 0) {
+		uint32_t thisrun_count = fifo_data_size / info->program_unit;
+		if (thisrun_count > count)
+			thisrun_count = count;
+
+		uint32_t thisrun_bytes = thisrun_count * info->program_unit;
+		uint32_t fifo_end = fifo_data_address + thisrun_bytes;
+		uint32_t wp = fifo_end;
+		uint32_t rp = fifo_data_address;
+
+		retval = target_write_buffer(target, fifo_data_address, thisrun_bytes, buffer);
+		if (retval != ERROR_OK)
+			break;
+
+		retval = target_write_u32(target, fifo_ctrl_address, wp);
+		if (retval != ERROR_OK)
+			break;
+		retval = target_write_u32(target, fifo_ctrl_address + 4, rp);
+		if (retval != ERROR_OK)
+			break;
+
+		buf_set_u32(reg_params[0].value, 0, 32, source->address);
+		buf_set_u32(reg_params[1].value, 0, 32, fifo_end);
+		buf_set_u32(reg_params[2].value, 0, 32, target_address);
+		buf_set_u32(reg_params[3].value, 0, 32, thisrun_count);
+		buf_set_u32(reg_params[4].value, 0, 32, stack_pointer);
+
+		retval = target_run_algorithm(target, 0, NULL,
+				ARRAY_SIZE(reg_params), reg_params,
+				write_algorithm->address, 0,
+				(thisrun_count * RA8D1_TIMEOUT_PROG_MS) + 200, &armv7m_info);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("error executing RA8D1 synchronous flash write algorithm");
+			break;
+		}
+
+		retval = ra8d1_check_errors(target, false);
+		if (retval != ERROR_OK)
+			break;
+
+		target_address += thisrun_bytes;
+		buffer += thisrun_bytes;
+		count -= thisrun_count;
+	}
+
+	destroy_reg_param(&reg_params[0]);
+	destroy_reg_param(&reg_params[1]);
+	destroy_reg_param(&reg_params[2]);
+	destroy_reg_param(&reg_params[3]);
+	destroy_reg_param(&reg_params[4]);
+
+cleanup:
+	target_free_working_area(target, source);
+	target_free_working_area(target, write_algorithm);
+	return retval;
+}
+
+static int ra8d1_write_block_without_loader(struct flash_bank *bank,
+		const uint8_t *buffer, uint32_t offset, uint32_t count)
 {
 	struct ra8d1_flash_bank *info = bank->driver_priv;
 	uint32_t address = bank->base + offset;
-	uint32_t unit_count = count / info->program_unit;
 
-	for (uint32_t i = 0; i < unit_count; i++) {
+	while (count--) {
 		int retval = ra8d1_program_one_unit(bank, address, buffer);
 		if (retval != ERROR_OK)
 			return retval;
@@ -350,7 +585,40 @@ static int ra8d1_write(struct flash_bank *bank, const uint8_t *buffer, uint32_t 
 	if (retval != ERROR_OK)
 		goto out;
 
-	retval = ra8d1_write_slow(bank, buffer, offset, aligned_count);
+	{
+		uint32_t unit_count = aligned_count / info->program_unit;
+		if (info->is_data_flash)
+			retval = ra8d1_write_block_async(bank, buffer, offset, unit_count);
+		else
+			retval = ra8d1_write_block_sync(bank, buffer, offset, unit_count);
+		if (retval == ERROR_FLASH_OPERATION_FAILED) {
+			uint32_t fstatr = 0;
+			uint32_t feaddr = 0;
+			uint16_t fcmdr = 0;
+			uint8_t fastat = 0;
+			(void)target_read_u32(target, RA8D1_REG_FSTATR, &fstatr);
+			(void)target_read_u8(target, RA8D1_REG_FASTAT, &fastat);
+			(void)target_read_u16(target, RA8D1_REG_FCMDR, &fcmdr);
+			(void)target_read_u32(target, RA8D1_REG_FEADDR, &feaddr);
+			LOG_ERROR("RA8D1 loader write failed: FSTATR=0x%08" PRIx32 ", FASTAT=0x%02" PRIx8
+					", FCMDR=0x%04" PRIx16 ", FEADDR=0x%08" PRIx32,
+					fstatr, fastat, fcmdr, feaddr);
+
+			int retval2 = ra8d1_disable_pe(bank);
+			if (retval2 == ERROR_OK)
+				retval2 = ra8d1_enable_pe(bank);
+			if (retval2 != ERROR_OK)
+				retval = retval2;
+		}
+		if ((retval == ERROR_TARGET_RESOURCE_NOT_AVAILABLE) ||
+				(retval == ERROR_FLASH_OPERATION_FAILED)) {
+			if (!ra8d1_fallback_write_logged) {
+				LOG_WARNING("RA8D1: fallback to slow DAP write path");
+				ra8d1_fallback_write_logged = true;
+			}
+			retval = ra8d1_write_block_without_loader(bank, buffer, offset, unit_count);
+		}
+	}
 
 	{
 		int retval2 = ra8d1_disable_pe(bank);

@@ -50,8 +50,24 @@
 
 #define RA8D1_FACI_CMD_PROGRAM       0xE8u
 #define RA8D1_FACI_CMD_CODE_ERASE    0x20u
-#define RA8D1_FACI_CMD_DATA_ERASE    0x21u
+#define RA8D1_FACI_CMD_DATA_ERASE    0x20u
 #define RA8D1_FACI_CMD_STATUS_CLEAR  0x50u
 #define RA8D1_FACI_CMD_EXECUTE       0xD0u
+
+#define RA8D1_LOADER_STACK_SIZE      256u
+
+struct ra8d1_loader_work_area {
+	uint32_t program_unit;
+	uint8_t stack[RA8D1_LOADER_STACK_SIZE];
+	struct flash_async_algorithm_circbuf {
+#ifdef OPENOCD_CONTRIB_LOADERS_FLASH_RENESAS_RA8D1
+		uint8_t *wp;
+		uint8_t *rp;
+#else
+		uint32_t wp;
+		uint32_t rp;
+#endif
+	} fifo;
+};
 
 #endif /* OPENOCD_FLASH_NOR_RENESAS_RA8D1_H */
