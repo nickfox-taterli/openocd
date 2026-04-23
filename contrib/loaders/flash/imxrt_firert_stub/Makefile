@@ -1,0 +1,48 @@
+OUT := build
+TP := third_party
+
+CC := arm-none-eabi-gcc
+OBJCOPY := arm-none-eabi-objcopy
+SIZE := arm-none-eabi-size
+
+CFLAGS := -mcpu=cortex-m7 -mthumb -mfloat-abi=soft \
+	-Os -ffreestanding -fno-builtin -fdata-sections -ffunction-sections \
+	-fno-common -fomit-frame-pointer -Wall -Wextra -Wno-unused-parameter \
+	-Wno-unused-function -DNDEBUG \
+	-DFSL_SDK_DISABLE_DRIVER_CLOCK_CONTROL=1 \
+	-DFSL_SDK_DISABLE_DRIVER_RESET_CONTROL=1 \
+	-DCPU_MIMXRT1052CVL5B \
+	-I$(TP)/devices/MIMXRT1052 \
+	-I$(TP)/devices/MIMXRT1052/periph \
+	-I$(TP)/Core/Include \
+	-I$(TP)/Core/Include/CMSIS \
+	-I$(TP)/drivers/Include \
+	-I.
+
+LDFLAGS := -nostdlib -nostartfiles -Wl,--gc-sections -T linker.ld
+
+SRCS := stub.c $(TP)/drivers/Source/fsl_flexspi.c
+OBJS := $(OUT)/stub.o $(OUT)/fsl_flexspi.o
+
+all: $(OUT)/firert_stub.bin
+
+$(OUT):
+	mkdir -p $(OUT)
+
+$(OUT)/stub.o: stub.c protocol.h | $(OUT)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OUT)/fsl_flexspi.o: $(TP)/drivers/Source/fsl_flexspi.c | $(OUT)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OUT)/firert_stub.elf: $(OBJS) linker.ld
+	$(CC) $(OBJS) $(LDFLAGS) -o $@
+	$(SIZE) $@
+
+$(OUT)/firert_stub.bin: $(OUT)/firert_stub.elf
+	$(OBJCOPY) -O binary $< $@
+
+clean:
+	rm -rf $(OUT)
+
+.PHONY: all clean
