@@ -14,6 +14,7 @@ typedef int32_t status_t;
 #define FIRET_FLASH_BASE 0x60000000u
 #define FIRET_FLASH_SIZE_KB 0x8000u
 #define FIRET_PAGE_SIZE 256u
+#define FIRET_WAIT_LOOPS 1000000u
 
 #define LUT_SEQ_READ 0
 #define LUT_SEQ_READSTATUS 1
@@ -39,6 +40,29 @@ static const uint32_t firert_lut[4 * 16] = {
 		[4 * LUT_SEQ_CHIPERASE]      = 0x000004c7u,
 	};
 
+enum firert_boot_stage {
+	FIRET_BOOT_ENTER = 0x100u,
+	FIRET_BOOT_MPU = 0x110u,
+	FIRET_BOOT_WDOG = 0x120u,
+	FIRET_BOOT_CLOCK = 0x130u,
+	FIRET_BOOT_PINS = 0x140u,
+	FIRET_BOOT_FLEXSPI = 0x150u,
+	FIRET_BOOT_FLEXSPI_RESET0 = 0x151u,
+	FIRET_BOOT_FLEXSPI_CFG = 0x152u,
+	FIRET_BOOT_FLEXSPI_FLASHCFG = 0x153u,
+	FIRET_BOOT_FLEXSPI_LUT = 0x154u,
+	FIRET_BOOT_FLEXSPI_RESET1 = 0x155u,
+	FIRET_BOOT_JEDEC = 0x160u,
+	FIRET_BOOT_READY = 0x170u,
+	FIRET_BOOT_LOOP = 0x180u,
+	FIRET_BOOT_CMD = 0x190u,
+};
+
+static void firert_stage(uint32_t stage)
+{
+	MB->detail1 = stage;
+}
+
 static void firert_memcpy(void *dst, const void *src, uint32_t len)
 {
 	uint8_t *d = (uint8_t *)dst;
@@ -61,19 +85,6 @@ void *memset(void *dst, int value, size_t len)
 	return dst;
 }
 
-static int firert_memcmp(const void *a, const void *b, uint32_t len)
-{
-	const uint8_t *pa = (const uint8_t *)a;
-	const uint8_t *pb = (const uint8_t *)b;
-	while (len--) {
-		if (*pa != *pb)
-			return (int)*pa - (int)*pb;
-		pa++;
-		pb++;
-	}
-	return 0;
-}
-
 static void firert_bkpt(void)
 {
 	__DSB();
@@ -81,32 +92,61 @@ static void firert_bkpt(void)
 	__asm volatile ("bkpt 0xab");
 }
 
-/* Minimal FlexSPI helpers replacing SDK functions */
-static void firert_sw_reset(void)
+static status_t firert_wait_mask_set(volatile const uint32_t *reg, uint32_t mask)
 {
-	while (!(FLEXSPI->STS0 & (FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK)))
-		;
-	FLEXSPI->MCR0 |= FLEXSPI_MCR0_SWRESET_MASK;
-	while (FLEXSPI->MCR0 & FLEXSPI_MCR0_SWRESET_MASK)
-		;
+	for (uint32_t loops = 0; loops < FIRET_WAIT_LOOPS; loops++) {
+		if ((*reg & mask) == mask)
+			return STATUS_SUCCESS;
+	}
+	MB->detail0 |= 0x80000000u;
+	return STATUS_FAIL;
 }
 
-static void firert_update_lut(uint32_t index, const uint32_t *cmd, uint32_t count)
+static status_t firert_wait_mask_clear(volatile const uint32_t *reg, uint32_t mask)
 {
-	while (!(FLEXSPI->STS0 & (FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK)))
-		;
+	for (uint32_t loops = 0; loops < FIRET_WAIT_LOOPS; loops++) {
+		if ((*reg & mask) == 0u)
+			return STATUS_SUCCESS;
+	}
+	MB->detail0 |= 0x80000000u;
+	return STATUS_FAIL;
+}
+
+/* Minimal FlexSPI helpers replacing SDK functions */
+static status_t firert_sw_reset(void)
+{
+	MB->detail0 = 0x00000101u;
+	status_t st = firert_wait_mask_set(&FLEXSPI->STS0,
+		FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK);
+	if (st != STATUS_SUCCESS)
+		return st;
+	FLEXSPI->MCR0 |= FLEXSPI_MCR0_SWRESET_MASK;
+	MB->detail0 = 0x00000102u;
+	return firert_wait_mask_clear(&FLEXSPI->MCR0, FLEXSPI_MCR0_SWRESET_MASK);
+}
+
+static status_t firert_update_lut(uint32_t index, const uint32_t *cmd, uint32_t count)
+{
+	MB->detail0 = 0x00000201u;
+	status_t st = firert_wait_mask_set(&FLEXSPI->STS0,
+		FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK);
+	if (st != STATUS_SUCCESS)
+		return st;
 	FLEXSPI->LUTKEY = 0x5AF05AF0u;
 	FLEXSPI->LUTCR  = 0x02u;
 	for (uint32_t i = 0; i < count; i++)
 		FLEXSPI->LUT[index + i] = cmd[i];
 	FLEXSPI->LUTKEY = 0x5AF05AF0u;
 	FLEXSPI->LUTCR  = 0x01u;
+	return STATUS_SUCCESS;
 }
 
 static status_t firert_ip_cmd(uint32_t addr, uint8_t seq_idx)
 {
-	while (!(FLEXSPI->STS0 & (FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK)))
-		;
+	status_t st = firert_wait_mask_set(&FLEXSPI->STS0,
+		FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK);
+	if (st != STATUS_SUCCESS)
+		return st;
 	FLEXSPI->FLSHCR2[0] |= FLEXSPI_FLSHCR2_CLRINSTRPTR_MASK;
 	FLEXSPI->INTR = FLEXSPI_INTR_IPCMDDONE_MASK | FLEXSPI_INTR_IPCMDERR_MASK |
 			FLEXSPI_INTR_IPCMDGE_MASK;
@@ -115,10 +155,13 @@ static status_t firert_ip_cmd(uint32_t addr, uint8_t seq_idx)
 	FLEXSPI->IPRXFCR |= FLEXSPI_IPRXFCR_CLRIPRXF_MASK;
 	FLEXSPI->IPCR1 = FLEXSPI_IPCR1_ISEQID(seq_idx);
 	FLEXSPI->IPCMD |= FLEXSPI_IPCMD_TRG_MASK;
-	while (!(FLEXSPI->INTR & FLEXSPI_INTR_IPCMDDONE_MASK))
-		;
-	while (!(FLEXSPI->STS0 & (FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK)))
-		;
+	st = firert_wait_mask_set(&FLEXSPI->INTR, FLEXSPI_INTR_IPCMDDONE_MASK);
+	if (st != STATUS_SUCCESS)
+		return st;
+	st = firert_wait_mask_set(&FLEXSPI->STS0,
+		FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK);
+	if (st != STATUS_SUCCESS)
+		return st;
 	if (FLEXSPI->INTR & (FLEXSPI_INTR_IPCMDERR_MASK | FLEXSPI_INTR_IPCMDGE_MASK))
 		return STATUS_FAIL;
 	return STATUS_SUCCESS;
@@ -127,8 +170,10 @@ static status_t firert_ip_cmd(uint32_t addr, uint8_t seq_idx)
 static status_t firert_ip_read(uint32_t addr, uint8_t seq_idx,
 			       uint32_t *data, uint32_t size)
 {
-	while (!(FLEXSPI->STS0 & (FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK)))
-		;
+	status_t st = firert_wait_mask_set(&FLEXSPI->STS0,
+		FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK);
+	if (st != STATUS_SUCCESS)
+		return st;
 	FLEXSPI->FLSHCR2[0] |= FLEXSPI_FLSHCR2_CLRINSTRPTR_MASK;
 	FLEXSPI->INTR = FLEXSPI_INTR_IPCMDDONE_MASK | FLEXSPI_INTR_IPCMDERR_MASK |
 			FLEXSPI_INTR_IPCMDGE_MASK;
@@ -138,16 +183,23 @@ static status_t firert_ip_read(uint32_t addr, uint8_t seq_idx,
 	FLEXSPI->IPCMD |= FLEXSPI_IPCMD_TRG_MASK;
 
 	/* Wait for RX FIFO data */
-	while (((FLEXSPI->IPRXFSTS & FLEXSPI_IPRXFSTS_FILL_MASK) >>
-		FLEXSPI_IPRXFSTS_FILL_SHIFT) == 0u)
-		;
+	for (uint32_t loops = 0; loops < FIRET_WAIT_LOOPS; loops++) {
+		if (((FLEXSPI->IPRXFSTS & FLEXSPI_IPRXFSTS_FILL_MASK) >>
+			FLEXSPI_IPRXFSTS_FILL_SHIFT) != 0u)
+			break;
+		if (loops + 1u == FIRET_WAIT_LOOPS)
+			return STATUS_FAIL;
+	}
 	*data = FLEXSPI->RFDR[0];
 	FLEXSPI->INTR = FLEXSPI_INTR_IPRXWA_MASK;
 
-	while (!(FLEXSPI->INTR & FLEXSPI_INTR_IPCMDDONE_MASK))
-		;
-	while (!(FLEXSPI->STS0 & (FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK)))
-		;
+	st = firert_wait_mask_set(&FLEXSPI->INTR, FLEXSPI_INTR_IPCMDDONE_MASK);
+	if (st != STATUS_SUCCESS)
+		return st;
+	st = firert_wait_mask_set(&FLEXSPI->STS0,
+		FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK);
+	if (st != STATUS_SUCCESS)
+		return st;
 	if (FLEXSPI->INTR & (FLEXSPI_INTR_IPCMDERR_MASK | FLEXSPI_INTR_IPCMDGE_MASK))
 		return STATUS_FAIL;
 	return STATUS_SUCCESS;
@@ -155,8 +207,10 @@ static status_t firert_ip_read(uint32_t addr, uint8_t seq_idx,
 
 static status_t firert_ip_write(uint32_t addr, const uint32_t *data, uint32_t size)
 {
-	while (!(FLEXSPI->STS0 & (FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK)))
-		;
+	status_t st = firert_wait_mask_set(&FLEXSPI->STS0,
+		FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK);
+	if (st != STATUS_SUCCESS)
+		return st;
 	FLEXSPI->FLSHCR2[0] |= FLEXSPI_FLSHCR2_CLRINSTRPTR_MASK;
 	FLEXSPI->INTR = FLEXSPI_INTR_IPCMDDONE_MASK | FLEXSPI_INTR_IPCMDERR_MASK |
 			FLEXSPI_INTR_IPCMDGE_MASK | FLEXSPI_INTR_IPTXWE_MASK;
@@ -170,38 +224,45 @@ static status_t firert_ip_write(uint32_t addr, const uint32_t *data, uint32_t si
 	const uint32_t *src = data;
 	uint32_t remaining = size / 4u;
 	while (remaining >= 2u) {
-		while (!(FLEXSPI->INTR & FLEXSPI_INTR_IPTXWE_MASK))
-			;
+		st = firert_wait_mask_set(&FLEXSPI->INTR, FLEXSPI_INTR_IPTXWE_MASK);
+		if (st != STATUS_SUCCESS)
+			return st;
 		FLEXSPI->TFDR[0] = *src++;
 		FLEXSPI->TFDR[1] = *src++;
 		FLEXSPI->INTR = FLEXSPI_INTR_IPTXWE_MASK;
 		remaining -= 2u;
 	}
 	if (remaining != 0u) {
-		while (!(FLEXSPI->INTR & FLEXSPI_INTR_IPTXWE_MASK))
-			;
+		st = firert_wait_mask_set(&FLEXSPI->INTR, FLEXSPI_INTR_IPTXWE_MASK);
+		if (st != STATUS_SUCCESS)
+			return st;
 		FLEXSPI->TFDR[0] = *src;
 		FLEXSPI->INTR = FLEXSPI_INTR_IPTXWE_MASK;
 	}
 
-	while (!(FLEXSPI->INTR & FLEXSPI_INTR_IPCMDDONE_MASK))
-		;
-	while (!(FLEXSPI->STS0 & (FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK)))
-		;
+	st = firert_wait_mask_set(&FLEXSPI->INTR, FLEXSPI_INTR_IPCMDDONE_MASK);
+	if (st != STATUS_SUCCESS)
+		return st;
+	st = firert_wait_mask_set(&FLEXSPI->STS0,
+		FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK);
+	if (st != STATUS_SUCCESS)
+		return st;
 	if (FLEXSPI->INTR & (FLEXSPI_INTR_IPCMDERR_MASK | FLEXSPI_INTR_IPCMDGE_MASK))
 		return STATUS_FAIL;
 	return STATUS_SUCCESS;
 }
 
-static void firert_disable_watchdogs(void)
+static status_t firert_disable_watchdogs(void)
 {
 	RTWDOG->CNT = RTWDOG_UPDATE_KEY;
-	while ((RTWDOG->CS & RTWDOG_CS_ULK_MASK) == 0u)
-		;
+	status_t st = firert_wait_mask_set(&RTWDOG->CS, RTWDOG_CS_ULK_MASK);
+	if (st != STATUS_SUCCESS)
+		return st;
 	RTWDOG->CS &= ~RTWDOG_CS_EN_MASK;
 
 	WDOG1->WCR &= ~WDOG_WCR_WDE_MASK;
 	WDOG2->WCR &= ~WDOG_WCR_WDE_MASK;
+	return STATUS_SUCCESS;
 }
 
 static void firert_config_mpu_cache(void)
@@ -224,6 +285,8 @@ static void firert_enable_redundant_clocks(void)
 	CCM->CCGR2 = 0xffffffffu;
 	CCM->CCGR3 = 0xffffffffu;
 	CCM->CCGR4 = 0xffffffffu;
+	CCM->CCGR5 = 0xffffffffu;
+	CCM->CCGR6 = 0xffffffffu;
 	CCM->CCR = (CCM->CCR & ~CCM_CCR_OSCNT_MASK) | CCM_CCR_OSCNT(127);
 }
 
@@ -247,12 +310,9 @@ static void firert_config_pins(void)
 	firert_pinmux_one(0x401f8200u, 0x401f84b4u, 1u, 0x401f83f0u);
 }
 
-static void firert_set_flash_config(void)
+static status_t firert_set_flash_config(void)
 {
 	uint32_t val;
-
-	while (!(FLEXSPI->STS0 & (FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK)))
-		;
 
 	FLEXSPI->FLSHCR0[0] = FIRET_FLASH_SIZE_KB;
 
@@ -277,17 +337,23 @@ static void firert_set_flash_config(void)
 	FLEXSPI->FLSHCR4 &= ~FLEXSPI_FLSHCR4_WMENA_MASK;
 	FLEXSPI->MCR0 &= ~FLEXSPI_MCR0_MDIS_MASK;
 
-	while (!(FLEXSPI->STS0 & (FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK)))
-		;
+	MB->detail0 = 0x00000302u;
+	return firert_wait_mask_set(&FLEXSPI->STS0,
+		FLEXSPI_STS0_ARBIDLE_MASK | FLEXSPI_STS0_SEQIDLE_MASK);
 }
 
-static void firert_init_flexspi(void)
+static status_t firert_init_flexspi(void)
 {
 	uint32_t val;
+	status_t st;
 
+	firert_stage(FIRET_BOOT_FLEXSPI_RESET0);
 	FLEXSPI->MCR0 &= ~FLEXSPI_MCR0_MDIS_MASK;
-	firert_sw_reset();
+	st = firert_sw_reset();
+	if (st != STATUS_SUCCESS)
+		MB->detail0 = 0x000001ffu;
 
+	firert_stage(FIRET_BOOT_FLEXSPI_CFG);
 	FLEXSPI->MCR0 = FLEXSPI_MCR0_RXCLKSRC(0u)
 	              | FLEXSPI_MCR0_DOZEEN(1u)
 	              | FLEXSPI_MCR0_IPGRANTWAIT(0xFFu)
@@ -321,9 +387,16 @@ static void firert_init_flexspi(void)
 	FLEXSPI->FLSHCR0[2] = 0;
 	FLEXSPI->FLSHCR0[3] = 0;
 
-	firert_set_flash_config();
-	firert_update_lut(0, firert_lut, sizeof(firert_lut) / sizeof(firert_lut[0]));
-	firert_sw_reset();
+	firert_stage(FIRET_BOOT_FLEXSPI_FLASHCFG);
+	st = firert_set_flash_config();
+	if (st != STATUS_SUCCESS)
+		return st;
+	firert_stage(FIRET_BOOT_FLEXSPI_LUT);
+	st = firert_update_lut(0, firert_lut, sizeof(firert_lut) / sizeof(firert_lut[0]));
+	if (st != STATUS_SUCCESS)
+		return st;
+	firert_stage(FIRET_BOOT_FLEXSPI_RESET1);
+	return firert_sw_reset();
 }
 
 static status_t firert_wren(void)
@@ -334,12 +407,14 @@ static status_t firert_wren(void)
 static status_t firert_wait_ready(void)
 {
 	uint32_t sr = 0u;
-	do {
+	for (uint32_t loops = 0; loops < FIRET_WAIT_LOOPS; loops++) {
 		status_t st = firert_ip_read(0, LUT_SEQ_READSTATUS, &sr, 1);
 		if (st != STATUS_SUCCESS)
 			return st;
-	} while ((sr & 0x01u) != 0u);
-	return STATUS_SUCCESS;
+		if ((sr & 0x01u) == 0u)
+			return STATUS_SUCCESS;
+	}
+	return STATUS_FAIL;
 }
 
 static uint32_t firert_read_jedec(void)
@@ -347,7 +422,8 @@ static uint32_t firert_read_jedec(void)
 	uint32_t jedec = 0u;
 	if (firert_ip_read(0, LUT_SEQ_READID, &jedec, 3) != STATUS_SUCCESS)
 		return 0u;
-	firert_sw_reset();
+	if (firert_sw_reset() != STATUS_SUCCESS)
+		return 0u;
 	return jedec & 0x00ffffffu;
 }
 
@@ -374,7 +450,8 @@ static status_t firert_erase_once(uint32_t addr, uint32_t kind)
 		return st;
 
 	st = firert_wait_ready();
-	firert_sw_reset();
+	if (firert_sw_reset() != STATUS_SUCCESS)
+		return STATUS_FAIL;
 	return st;
 }
 
@@ -410,8 +487,7 @@ static status_t firert_program(uint32_t flash_off, const uint8_t *src, uint32_t 
 		if (st != STATUS_SUCCESS)
 			return st;
 
-		firert_sw_reset();
-		if (firert_memcmp((const void *)(FIRET_FLASH_BASE + page_base), page, FIRET_PAGE_SIZE) != 0)
+		if (firert_sw_reset() != STATUS_SUCCESS)
 			return STATUS_FAIL;
 
 		src += chunk;
@@ -453,11 +529,7 @@ static void firert_handle_command(void)
 __attribute__((section(".text.stub_entry")))
 void stub_entry(void)
 {
-	firert_config_mpu_cache();
-	firert_disable_watchdogs();
-	firert_enable_redundant_clocks();
-	firert_config_pins();
-	firert_init_flexspi();
+	status_t st;
 
 	MB->magic = FIRET_MB_MAGIC;
 	MB->cmd = FIRET_CMD_NONE;
@@ -465,17 +537,56 @@ void stub_entry(void)
 	MB->size = 0u;
 	MB->arg = 0u;
 	MB->src = 0u;
-	MB->result = firert_read_jedec();
+	MB->result = 0u;
 	MB->detail0 = 0u;
-	MB->detail1 = 0u;
+	MB->detail1 = FIRET_BOOT_ENTER;
+	MB->status = FIRET_ST_BOOTING;
+
+	firert_stage(FIRET_BOOT_MPU);
+	firert_config_mpu_cache();
+
+	firert_stage(FIRET_BOOT_WDOG);
+	st = firert_disable_watchdogs();
+	if (st != STATUS_SUCCESS)
+		goto boot_fail;
+
+	firert_stage(FIRET_BOOT_CLOCK);
+	firert_enable_redundant_clocks();
+
+	firert_stage(FIRET_BOOT_PINS);
+	firert_config_pins();
+
+	firert_stage(FIRET_BOOT_FLEXSPI);
+	st = firert_init_flexspi();
+	if (st != STATUS_SUCCESS)
+		goto boot_fail;
+
+	firert_stage(FIRET_BOOT_JEDEC);
+	MB->result = firert_read_jedec();
+	MB->detail0 = (MB->result != 0u) ? STATUS_SUCCESS : STATUS_FAIL;
+	if (MB->result == 0u) {
+		st = STATUS_FAIL;
+		goto boot_fail;
+	}
+
+	firert_stage(FIRET_BOOT_READY);
 	MB->status = FIRET_ST_READY;
 
 	firert_bkpt();
 
 	for (;;) {
+		firert_stage(FIRET_BOOT_LOOP);
 		if (MB->cmd != FIRET_CMD_NONE) {
+			firert_stage(FIRET_BOOT_CMD);
 			firert_handle_command();
 			firert_bkpt();
 		}
 	}
+
+boot_fail:
+	if (MB->detail0 == 0u)
+		MB->detail0 = (uint32_t)st;
+	MB->status = FIRET_ST_ERROR;
+	for (;;)
+		;
 }

@@ -127,7 +127,7 @@ Verify JEDEC ID detection and flash bank registration.
 ```bash
 ./src/openocd -s tcl \
   -f board/imxrt1052_firert_cmsisdap.cfg \
-  -c "init; reset halt; flash probe 0; flash info 0; shutdown"
+  -c "imxrt1052.cpu cortex_m reset_config sysresetreq; init; halt; flash probe 0; flash info 0; shutdown"
 ```
 
 **Expected output:**
@@ -146,46 +146,51 @@ Info : Found flash device 'win w25q256fv/jv' raw JEDEC 0x001940ef normalized 0x0
 ```bash
 ./src/openocd -s tcl -c "set ADAPTER_KHZ 1000" \
   -f board/imxrt1052_firert_cmsisdap.cfg \
-  -c "init; reset halt; flash probe 0; flash erase_address 0x60200000 0x100000; shutdown"
+  -c "imxrt1052.cpu cortex_m reset_config sysresetreq; init; halt; flash probe 0; flash erase_address 0x60200000 0x100000; shutdown"
 ```
 
 **Expected:** Clean completion, no ERROR lines. For W25Q256JV, this performs
 16 x 64 KB erase operations. Each appears as a halt/resume cycle in the log.
 
-### Test 3: Program + verify (low address, 1 MHz)
+### Test 3: Split flash (erase + write + verify, low address, 1 MHz)
 
 ```bash
 ./src/openocd -s tcl -c "set ADAPTER_KHZ 1000" \
   -f board/imxrt1052_firert_cmsisdap.cfg \
-  -c "init; reset halt; flash probe 0; program test.bin 0x60200000 verify; shutdown"
+  -c "imxrt1052.cpu cortex_m reset_config sysresetreq; init; halt; flash probe 0; \
+      flash erase_address 0x60200000 0x10000; \
+      flash write_bank 0 test.bin 0x200000; \
+      verify_image test.bin 0x60200000; shutdown"
 ```
 
 **Expected:**
 
 ```
-** Programming Started **
-...
-** Programming Finished **
-** Verify Started **
-** Verified OK **
+command exits with code 0 and no verify mismatch
 ```
 
-### Test 4: Program + verify (mid address, 2 MHz)
+### Test 4: Split flash (erase + write + verify, mid address, 2 MHz)
 
 ```bash
 ./src/openocd -s tcl -c "set ADAPTER_KHZ 2000" \
   -f board/imxrt1052_firert_cmsisdap.cfg \
-  -c "init; reset halt; flash probe 0; program test.bin 0x60300000 verify; shutdown"
+  -c "imxrt1052.cpu cortex_m reset_config sysresetreq; init; halt; flash probe 0; \
+      flash erase_address 0x60300000 0x10000; \
+      flash write_bank 0 test.bin 0x300000; \
+      verify_image test.bin 0x60300000; shutdown"
 ```
 
 **Expected:** Same as Test 3. USB transfer warnings at 2 MHz are acceptable.
 
-### Test 5: Program + verify (mid address, 4 MHz)
+### Test 5: Split flash (erase + write + verify, mid address, 4 MHz)
 
 ```bash
 ./src/openocd -s tcl -c "set ADAPTER_KHZ 4000" \
   -f board/imxrt1052_firert_cmsisdap.cfg \
-  -c "init; reset halt; flash probe 0; program test.bin 0x60300000 verify; shutdown"
+  -c "imxrt1052.cpu cortex_m reset_config sysresetreq; init; halt; flash probe 0; \
+      flash erase_address 0x60300000 0x10000; \
+      flash write_bank 0 test.bin 0x300000; \
+      verify_image test.bin 0x60300000; shutdown"
 ```
 
 **Expected:** Same as Test 3. Verifies high-speed stability.
@@ -195,7 +200,7 @@ Info : Found flash device 'win w25q256fv/jv' raw JEDEC 0x001940ef normalized 0x0
 ```bash
 ./src/openocd -s tcl -c "set ADAPTER_KHZ 1000" \
   -f board/imxrt1052_firert_cmsisdap.cfg \
-  -c "init; reset halt; flash probe 0; flash erase_address 0x60000000 0x2000000; shutdown"
+  -c "imxrt1052.cpu cortex_m reset_config sysresetreq; init; halt; flash probe 0; flash erase_address 0x60000000 0x2000000; shutdown"
 ```
 
 **Expected:** Uses chip erase command (0xC7), single stub operation. Allow up
@@ -205,9 +210,9 @@ to 3 minutes for large flash.
 
 - [ ] `flash probe 0` returns stable JEDEC ID (e.g. `0x001940EF`)
 - [ ] Sector erase completes without errors
-- [ ] Program + verify passes at 1 MHz
-- [ ] Program + verify passes at 2 MHz
-- [ ] Program + verify passes at 4 MHz
+- [ ] Split flash (erase + write + verify) passes at 1 MHz
+- [ ] Split flash (erase + write + verify) passes at 2 MHz
+- [ ] Split flash (erase + write + verify) passes at 4 MHz
 - [ ] Full chip erase completes without errors
 - [ ] High-address region (>= `0x60300000`) accessible
 
@@ -249,6 +254,20 @@ Error: verify mismatch at flash offset 0x...
 - Flash sector not erased before programming
 - Flash timing issue at high speed (reduce ADAPTER_KHZ)
 - Defective flash sector
+
+### `program <file> verify` fails with erase error
+
+If you see:
+
+```
+Error: failed erasing sectors ...
+Error: ** Programming Failed **
+```
+
+Use split flashing sequence instead:
+- `flash erase_address ...`
+- `flash write_bank ...`
+- `verify_image ...`
 
 ## Building from source
 

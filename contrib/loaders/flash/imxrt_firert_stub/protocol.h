@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-#define FIRET_MB_ADDR 0x20200000u
+#define FIRET_MB_ADDR 0x20206000u
 #define FIRET_MB_MAGIC 0x46525431u
 
 enum firert_mb_cmd {

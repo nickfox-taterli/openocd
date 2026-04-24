@@ -8,6 +8,7 @@
 #include "spi.h"
 
 #include <helper/binarybuffer.h>
+#include <helper/time_support.h>
 #include <target/register.h>
 
 #include "../../../contrib/loaders/flash/imxrt_firert_stub/protocol.h"
@@ -15,8 +16,10 @@
 
 #define FIRET_STUB_LOAD_ADDR 0x20202000u
 #define FIRET_STUB_STACK_PTR 0x20205ff0u
-#define FIRET_STUB_DATA_ADDR 0x20206000u
-#define FIRET_STUB_DATA_SIZE 0x00010000u
+#define FIRET_STUB_DATA_ADDR 0x20208000u
+#define FIRET_STUB_DATA_SIZE 0x00008000u
+#define FIRET_XFER_CHUNK_SIZE 256u
+#define FIRET_IO_RETRIES 3
 
 struct firert_flash_bank {
 	struct target *target;
@@ -65,6 +68,114 @@ static int firert_read_mailbox(struct target *target, struct firert_mailbox *mb)
 	return target_read_buffer(target, FIRET_MB_ADDR, sizeof(*mb), (uint8_t *)mb);
 }
 
+static int firert_read_mailbox_retry(struct target *target, struct firert_mailbox *mb)
+{
+	int retval = ERROR_FAIL;
+
+	for (unsigned int attempt = 1; attempt <= FIRET_IO_RETRIES; attempt++) {
+		retval = firert_read_mailbox(target, mb);
+		if (retval == ERROR_OK)
+			return ERROR_OK;
+
+		LOG_WARNING("i.MXRT mailbox read failed (attempt %u/%u), retval=%d",
+			attempt, FIRET_IO_RETRIES, retval);
+		alive_sleep(2);
+	}
+
+	return retval;
+}
+
+static int firert_wait_mailbox_done(struct target *target, int timeout_ms,
+		struct firert_mailbox *mb)
+{
+	int64_t start = timeval_ms();
+	int retval = ERROR_FAIL;
+
+	while ((timeval_ms() - start) < timeout_ms) {
+		retval = firert_read_mailbox_retry(target, mb);
+		if (retval == ERROR_OK) {
+			if (mb->status == FIRET_ST_DONE || mb->status == FIRET_ST_ERROR)
+				return ERROR_OK;
+		}
+
+		keep_alive();
+		alive_sleep(1);
+	}
+
+	return ERROR_TIMEOUT_REACHED;
+}
+
+static int firert_write_buffer_retry(struct target *target, target_addr_t addr,
+		const uint8_t *buf, uint32_t len)
+{
+	int retval = ERROR_FAIL;
+
+	for (unsigned int attempt = 1; attempt <= FIRET_IO_RETRIES; attempt++) {
+		uint32_t done = 0;
+
+		retval = firert_ensure_halted(target);
+		if (retval != ERROR_OK)
+			return retval;
+
+		alive_sleep(1);
+
+		while (done < len) {
+			uint32_t chunk = len - done;
+			if (chunk > FIRET_XFER_CHUNK_SIZE)
+				chunk = FIRET_XFER_CHUNK_SIZE;
+
+			retval = target_write_buffer(target, addr + done, chunk, buf + done);
+			if (retval != ERROR_OK)
+				break;
+			done += chunk;
+		}
+
+		if (retval == ERROR_OK)
+			return ERROR_OK;
+
+		LOG_WARNING("i.MXRT RAM upload failed (attempt %u/%u), retval=%d",
+			attempt, FIRET_IO_RETRIES, retval);
+		target_halt(target);
+		target_wait_state(target, TARGET_HALTED, 500);
+		alive_sleep(2);
+	}
+
+	return retval;
+}
+
+static int firert_write_buffer_checked(struct target *target, target_addr_t addr,
+		const uint8_t *buf, uint32_t len)
+{
+	uint8_t *verify;
+	int retval;
+
+	verify = malloc(len);
+	if (!verify)
+		return ERROR_FAIL;
+
+	retval = firert_write_buffer_retry(target, addr, buf, len);
+	if (retval != ERROR_OK)
+		goto out;
+
+	retval = firert_ensure_halted(target);
+	if (retval != ERROR_OK)
+		goto out;
+
+	retval = target_read_buffer(target, addr, len, verify);
+	if (retval != ERROR_OK)
+		goto out;
+
+	if (memcmp(buf, verify, len) != 0) {
+		LOG_ERROR("i.MXRT RAM staging verify mismatch at 0x%08" TARGET_PRIxADDR,
+			addr);
+		retval = ERROR_FLASH_OPERATION_FAILED;
+	}
+
+out:
+	free(verify);
+	return retval;
+}
+
 static int firert_resume_wait_halt(struct target *target, int timeout_ms)
 {
 	int retval;
@@ -94,8 +205,10 @@ static int firert_resume_wait_halt(struct target *target, int timeout_ms)
 
 	retval = target_wait_state(target, TARGET_HALTED, timeout_ms);
 	if (retval != ERROR_OK) {
+		LOG_WARNING("i.MXRT stub wait halt timeout, forcing halt and continuing");
 		target_halt(target);
-		target_wait_state(target, TARGET_HALTED, 1000);
+		if (target_wait_state(target, TARGET_HALTED, 1000) == ERROR_OK)
+			retval = ERROR_OK;
 	}
 
 	return retval;
@@ -104,50 +217,65 @@ static int firert_resume_wait_halt(struct target *target, int timeout_ms)
 static int firert_stub_load_and_boot(struct flash_bank *bank, struct firert_mailbox *mb)
 {
 	struct target *target = bank->target;
-	int retval;
+	int retval = ERROR_FAIL;
 
-	retval = firert_ensure_halted(target);
-	if (retval != ERROR_OK)
-		return retval;
+	for (unsigned int attempt = 1; attempt <= FIRET_IO_RETRIES; attempt++) {
+		retval = firert_ensure_halted(target);
+		if (retval != ERROR_OK)
+			return retval;
 
-	retval = target_write_buffer(target, FIRET_STUB_LOAD_ADDR,
-			imxrt_firert_stub_bin_len, imxrt_firert_stub_bin);
-	if (retval != ERROR_OK)
-		return retval;
+		retval = firert_write_buffer_retry(target, FIRET_STUB_LOAD_ADDR,
+				imxrt_firert_stub_bin, imxrt_firert_stub_bin_len);
+		if (retval != ERROR_OK)
+			continue;
 
-	retval = firert_set_reg_u32(target, "sp", FIRET_STUB_STACK_PTR);
-	if (retval != ERROR_OK)
-		return retval;
+		retval = firert_set_reg_u32(target, "sp", FIRET_STUB_STACK_PTR);
+		if (retval != ERROR_OK)
+			continue;
 
-	retval = firert_set_reg_u32(target, "pc", FIRET_STUB_LOAD_ADDR | 1u);
-	if (retval != ERROR_OK)
-		return retval;
+		retval = firert_set_reg_u32(target, "pc", FIRET_STUB_LOAD_ADDR | 1u);
+		if (retval != ERROR_OK)
+			continue;
 
-	retval = firert_set_reg_u32(target, "xpsr", 0x01000000u);
-	if (retval != ERROR_OK)
-		return retval;
+		retval = firert_set_reg_u32(target, "xpsr", 0x01000000u);
+		if (retval != ERROR_OK)
+			continue;
 
-	retval = target_resume(target, 1, 0, 0, 0);
-	if (retval != ERROR_OK)
-		return retval;
+		retval = target_resume(target, 1, 0, 0, 0);
+		if (retval != ERROR_OK)
+			continue;
 
-	retval = target_wait_state(target, TARGET_HALTED, 1000);
-	if (retval != ERROR_OK)
-		return retval;
+		retval = target_wait_state(target, TARGET_HALTED, 5000);
+		if (retval != ERROR_OK) {
+			LOG_WARNING("i.MXRT stub boot halt timeout, forcing halt for mailbox inspection");
+			target_halt(target);
+			if (target_wait_state(target, TARGET_HALTED, 1000) != ERROR_OK)
+				continue;
 
-	retval = firert_read_mailbox(target, mb);
-	if (retval != ERROR_OK)
-		return retval;
+			retval = firert_read_mailbox_retry(target, mb);
+			if (retval != ERROR_OK)
+				continue;
+		} else {
+			retval = firert_read_mailbox_retry(target, mb);
+			if (retval != ERROR_OK)
+				continue;
+		}
 
-	if (mb->magic != FIRET_MB_MAGIC) {
-		LOG_ERROR("i.MXRT stub mailbox magic mismatch: 0x%08" PRIx32, mb->magic);
-		return ERROR_FAIL;
+		LOG_INFO("imxrt stub boot: status=0x%08" PRIx32 " result=0x%08" PRIx32
+			" detail0=0x%08" PRIx32 " detail1=0x%08" PRIx32,
+			mb->status, mb->result, mb->detail0, mb->detail1);
+		if (mb->magic == FIRET_MB_MAGIC &&
+			mb->cmd == FIRET_CMD_NONE &&
+			mb->status == FIRET_ST_READY &&
+			mb->result != 0u &&
+			mb->result != 0xffffffffu)
+			return ERROR_OK;
+
+		retval = ERROR_FAIL;
 	}
 
-	LOG_INFO("imxrt stub boot: status=0x%08" PRIx32 " result=0x%08" PRIx32
-		" detail0=0x%08" PRIx32 " detail1=0x%08" PRIx32,
-		mb->status, mb->result, mb->detail0, mb->detail1);
-	return ERROR_OK;
+	LOG_ERROR("i.MXRT stub load/boot failed after %u attempts", FIRET_IO_RETRIES);
+	return retval;
 }
 
 static int firert_stub_go(struct flash_bank *bank, uint32_t cmd, uint32_t addr,
@@ -155,33 +283,44 @@ static int firert_stub_go(struct flash_bank *bank, uint32_t cmd, uint32_t addr,
 		struct firert_mailbox *mb)
 {
 	struct target *target = bank->target;
+	struct firert_mailbox mb_out;
 	int retval;
 
 	retval = firert_ensure_halted(target);
 	if (retval != ERROR_OK)
 		return retval;
 
-	retval = target_write_u32(target, FIRET_MB_ADDR + 0x08, addr);
+	mb_out.magic = FIRET_MB_MAGIC;
+	mb_out.cmd = cmd;
+	mb_out.addr = addr;
+	mb_out.size = size;
+	mb_out.arg = arg;
+	mb_out.src = src;
+	mb_out.status = FIRET_ST_BUSY;
+	mb_out.result = 0;
+	mb_out.detail0 = 0;
+	mb_out.detail1 = 0;
+
+	retval = target_write_buffer(target, FIRET_MB_ADDR, sizeof(mb_out), (uint8_t *)&mb_out);
 	if (retval != ERROR_OK)
 		return retval;
-	retval = target_write_u32(target, FIRET_MB_ADDR + 0x0c, size);
-	if (retval != ERROR_OK)
-		return retval;
-	retval = target_write_u32(target, FIRET_MB_ADDR + 0x10, arg);
-	if (retval != ERROR_OK)
-		return retval;
-	retval = target_write_u32(target, FIRET_MB_ADDR + 0x14, src);
-	if (retval != ERROR_OK)
-		return retval;
-	retval = target_write_u32(target, FIRET_MB_ADDR + 0x04, cmd);
+
+	retval = target_resume(target, 1, 0, 0, 0);
 	if (retval != ERROR_OK)
 		return retval;
 
 	retval = firert_resume_wait_halt(target, timeout_ms);
-	if (retval != ERROR_OK)
-		return retval;
+	if (retval != ERROR_OK) {
+		LOG_WARNING("i.MXRT stub halt-wait failed, fallback to mailbox polling");
+		retval = firert_wait_mailbox_done(target, timeout_ms, mb);
+		if (retval != ERROR_OK)
+			return retval;
 
-	retval = firert_read_mailbox(target, mb);
+		target_halt(target);
+		target_wait_state(target, TARGET_HALTED, 1000);
+	}
+
+	retval = firert_read_mailbox_retry(target, mb);
 	if (retval != ERROR_OK)
 		return retval;
 
@@ -358,7 +497,8 @@ static int firert_write(struct flash_bank *bank, const uint8_t *buffer,
 	while (count) {
 		uint32_t this_size = count > FIRET_STUB_DATA_SIZE ? FIRET_STUB_DATA_SIZE : count;
 
-		retval = target_write_buffer(bank->target, FIRET_STUB_DATA_ADDR, this_size, buffer);
+		retval = firert_write_buffer_checked(bank->target, FIRET_STUB_DATA_ADDR,
+			buffer, this_size);
 		if (retval != ERROR_OK)
 			break;
 
