@@ -14,10 +14,10 @@
 #include "../../../contrib/loaders/flash/imxrt_firert_stub/protocol.h"
 #include "imxrt_firert_stub_bin.inc"
 
-#define FIRET_STUB_LOAD_ADDR 0x20202000u
-#define FIRET_STUB_STACK_PTR 0x20205ff0u
+#define FIRET_STUB_LOAD_ADDR 0x20001000u
+#define FIRET_STUB_STACK_PTR 0x20002000u
 #define FIRET_STUB_DATA_ADDR 0x20208000u
-#define FIRET_STUB_DATA_SIZE 0x00008000u
+#define FIRET_STUB_DATA_SIZE 0x00010000u
 #define FIRET_XFER_CHUNK_SIZE 256u
 #define FIRET_IO_RETRIES 3
 
@@ -26,6 +26,7 @@ struct firert_flash_bank {
 	const struct flash_device *dev;
 	uint32_t jedec_raw;
 	uint32_t jedec_norm;
+	uint32_t soc;
 	bool probed;
 };
 
@@ -217,6 +218,7 @@ static int firert_resume_wait_halt(struct target *target, int timeout_ms)
 static int firert_stub_load_and_boot(struct flash_bank *bank, struct firert_mailbox *mb)
 {
 	struct target *target = bank->target;
+	struct firert_flash_bank *info = bank->driver_priv;
 	int retval = ERROR_FAIL;
 
 	for (unsigned int attempt = 1; attempt <= FIRET_IO_RETRIES; attempt++) {
@@ -233,11 +235,39 @@ static int firert_stub_load_and_boot(struct flash_bank *bank, struct firert_mail
 		if (retval != ERROR_OK)
 			continue;
 
+		retval = firert_set_reg_u32(target, "msp", FIRET_STUB_STACK_PTR);
+		if (retval != ERROR_OK)
+			continue;
+
+		retval = firert_set_reg_u32(target, "psp", FIRET_STUB_STACK_PTR);
+		if (retval != ERROR_OK)
+			continue;
+
+		retval = firert_set_reg_u32(target, "control", 0);
+		if (retval != ERROR_OK)
+			continue;
+
+		retval = firert_set_reg_u32(target, "primask", 1);
+		if (retval != ERROR_OK)
+			continue;
+
+		retval = firert_set_reg_u32(target, "basepri", 0);
+		if (retval != ERROR_OK)
+			continue;
+
+		retval = firert_set_reg_u32(target, "faultmask", 0);
+		if (retval != ERROR_OK)
+			continue;
+
 		retval = firert_set_reg_u32(target, "pc", FIRET_STUB_LOAD_ADDR | 1u);
 		if (retval != ERROR_OK)
 			continue;
 
 		retval = firert_set_reg_u32(target, "xpsr", 0x01000000u);
+		if (retval != ERROR_OK)
+			continue;
+
+		retval = firert_set_reg_u32(target, "r0", info->soc);
 		if (retval != ERROR_OK)
 			continue;
 
@@ -305,10 +335,6 @@ static int firert_stub_go(struct flash_bank *bank, uint32_t cmd, uint32_t addr,
 	if (retval != ERROR_OK)
 		return retval;
 
-	retval = target_resume(target, 1, 0, 0, 0);
-	if (retval != ERROR_OK)
-		return retval;
-
 	retval = firert_resume_wait_halt(target, timeout_ms);
 	if (retval != ERROR_OK) {
 		LOG_WARNING("i.MXRT stub halt-wait failed, fallback to mailbox polling");
@@ -350,6 +376,19 @@ FLASH_BANK_COMMAND_HANDLER(firert_flash_bank_command)
 		free(info);
 		LOG_ERROR("target '%s' not defined", CMD_ARGV[5]);
 		return ERROR_FAIL;
+	}
+
+	info->soc = FIRET_SOC_IMXRT1052;
+	if (CMD_ARGC > 6) {
+		if (!strcmp(CMD_ARGV[6], "imxrt1021"))
+			info->soc = FIRET_SOC_IMXRT1021;
+		else if (!strcmp(CMD_ARGV[6], "imxrt1052"))
+			info->soc = FIRET_SOC_IMXRT1052;
+		else {
+			free(info);
+			LOG_ERROR("unknown i.MXRT firert SoC '%s'", CMD_ARGV[6]);
+			return ERROR_COMMAND_SYNTAX_ERROR;
+		}
 	}
 
 	bank->driver_priv = info;
@@ -414,6 +453,7 @@ static int firert_auto_probe(struct flash_bank *bank)
 static int firert_erase(struct flash_bank *bank, unsigned int first, unsigned int last)
 {
 	struct firert_mailbox mb;
+	struct firert_flash_bank *info = bank->driver_priv;
 	uint32_t off;
 	uint32_t end;
 	int retval;
@@ -431,7 +471,7 @@ static int firert_erase(struct flash_bank *bank, unsigned int first, unsigned in
 
 	if (first == 0 && last == bank->num_sectors - 1) {
 		retval = firert_stub_go(bank, FIRET_CMD_ERASE, 0, 0,
-			FIRET_ERASE_CHIP, 0, 180000, &mb);
+			FIRET_ERASE_CHIP, 0, 600000, &mb);
 		if (retval != ERROR_OK)
 			return retval;
 		for (unsigned int i = 0; i < bank->num_sectors; i++)
@@ -449,7 +489,8 @@ static int firert_erase(struct flash_bank *bank, unsigned int first, unsigned in
 		if ((off % 0x10000u) == 0u && (end - off) >= 0x10000u) {
 			kind = FIRET_ERASE_64K;
 			step = 0x10000u;
-		} else if ((off % 0x8000u) == 0u && (end - off) >= 0x8000u) {
+		} else if (info->soc != FIRET_SOC_IMXRT1021 &&
+				(off % 0x8000u) == 0u && (end - off) >= 0x8000u) {
 			kind = FIRET_ERASE_32K;
 			step = 0x8000u;
 		} else {
@@ -503,7 +544,7 @@ static int firert_write(struct flash_bank *bank, const uint8_t *buffer,
 			break;
 
 		retval = firert_stub_go(bank, FIRET_CMD_PROGRAM, offset, this_size,
-			0, FIRET_STUB_DATA_ADDR, 30000, &mb);
+			0, FIRET_STUB_DATA_ADDR, 120000, &mb);
 		if (retval != ERROR_OK)
 			break;
 

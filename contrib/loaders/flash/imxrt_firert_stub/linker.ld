@@ -2,7 +2,7 @@ ENTRY(stub_entry)
 
 MEMORY
 {
-	ram (rwx) : ORIGIN = 0x20202000, LENGTH = 0x00004000
+	ram (rwx) : ORIGIN = 0x20001000, LENGTH = 0x00004000
 }
 
 SECTIONS

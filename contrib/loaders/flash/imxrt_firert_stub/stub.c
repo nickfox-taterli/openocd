@@ -15,6 +15,7 @@ typedef int32_t status_t;
 #define FIRET_FLASH_SIZE_KB 0x8000u
 #define FIRET_PAGE_SIZE 256u
 #define FIRET_WAIT_LOOPS 1000000u
+#define FIRET_CHIP_ERASE_WAIT_LOOPS 400000000u
 
 #define LUT_SEQ_READ 0
 #define LUT_SEQ_READSTATUS 1
@@ -40,6 +41,22 @@ static const uint32_t firert_lut[4 * 16] = {
 		[4 * LUT_SEQ_CHIPERASE]      = 0x000004c7u,
 	};
 
+static const uint32_t firert_rt1021_lut[4 * 16] = {
+		[4 * LUT_SEQ_READ]           = 0x08200413u,
+		[4 * LUT_SEQ_READ + 1]       = 0x00002404u,
+		[4 * LUT_SEQ_READSTATUS]     = 0x24010405u,
+		[4 * LUT_SEQ_WRITEENABLE]    = 0x00000406u,
+		[4 * LUT_SEQ_ERASE4K]        = 0x08200421u,
+		[4 * LUT_SEQ_PAGEPROGRAM]    = 0x08200412u,
+		[4 * LUT_SEQ_PAGEPROGRAM + 1] = 0x00002004u,
+		[4 * LUT_SEQ_READID]         = 0x2404049fu,
+		[4 * LUT_SEQ_ERASE32K]       = 0x08200421u,
+		[4 * LUT_SEQ_ERASE64K]       = 0x082004dcu,
+		[4 * LUT_SEQ_CHIPERASE]      = 0x000004c7u,
+	};
+
+static uint32_t firert_soc;
+
 enum firert_boot_stage {
 	FIRET_BOOT_ENTER = 0x100u,
 	FIRET_BOOT_MPU = 0x110u,
@@ -61,6 +78,11 @@ enum firert_boot_stage {
 static void firert_stage(uint32_t stage)
 {
 	MB->detail1 = stage;
+}
+
+static const uint32_t *firert_active_lut(void)
+{
+	return (firert_soc == FIRET_SOC_IMXRT1021) ? firert_rt1021_lut : firert_lut;
 }
 
 static void firert_memcpy(void *dst, const void *src, uint32_t len)
@@ -92,11 +114,24 @@ static void firert_bkpt(void)
 	__asm volatile ("bkpt 0xab");
 }
 
+static void firert_refresh_watchdogs(void)
+{
+	if (RTWDOG->CS & RTWDOG_CS_EN_MASK)
+		RTWDOG->CNT = RTWDOG_REFRESH_KEY;
+
+	WDOG1->WSR = 0x5555u;
+	WDOG1->WSR = 0xaaaau;
+	WDOG2->WSR = 0x5555u;
+	WDOG2->WSR = 0xaaaau;
+}
+
 static status_t firert_wait_mask_set(volatile const uint32_t *reg, uint32_t mask)
 {
 	for (uint32_t loops = 0; loops < FIRET_WAIT_LOOPS; loops++) {
 		if ((*reg & mask) == mask)
 			return STATUS_SUCCESS;
+		if ((loops & 0x3ffu) == 0x3ffu)
+			firert_refresh_watchdogs();
 	}
 	MB->detail0 |= 0x80000000u;
 	return STATUS_FAIL;
@@ -107,6 +142,8 @@ static status_t firert_wait_mask_clear(volatile const uint32_t *reg, uint32_t ma
 	for (uint32_t loops = 0; loops < FIRET_WAIT_LOOPS; loops++) {
 		if ((*reg & mask) == 0u)
 			return STATUS_SUCCESS;
+		if ((loops & 0x3ffu) == 0x3ffu)
+			firert_refresh_watchdogs();
 	}
 	MB->detail0 |= 0x80000000u;
 	return STATUS_FAIL;
@@ -187,6 +224,8 @@ static status_t firert_ip_read(uint32_t addr, uint8_t seq_idx,
 		if (((FLEXSPI->IPRXFSTS & FLEXSPI_IPRXFSTS_FILL_MASK) >>
 			FLEXSPI_IPRXFSTS_FILL_SHIFT) != 0u)
 			break;
+		if ((loops & 0x3ffu) == 0x3ffu)
+			firert_refresh_watchdogs();
 		if (loops + 1u == FIRET_WAIT_LOOPS)
 			return STATUS_FAIL;
 	}
@@ -254,14 +293,16 @@ static status_t firert_ip_write(uint32_t addr, const uint32_t *data, uint32_t si
 
 static status_t firert_disable_watchdogs(void)
 {
-	RTWDOG->CNT = RTWDOG_UPDATE_KEY;
-	status_t st = firert_wait_mask_set(&RTWDOG->CS, RTWDOG_CS_ULK_MASK);
-	if (st != STATUS_SUCCESS)
-		return st;
-	RTWDOG->CS &= ~RTWDOG_CS_EN_MASK;
+	if (RTWDOG->CS & RTWDOG_CS_UPDATE_MASK) {
+		RTWDOG->CNT = RTWDOG_UPDATE_KEY;
+		status_t st = firert_wait_mask_set(&RTWDOG->CS, RTWDOG_CS_ULK_MASK);
+		if (st == STATUS_SUCCESS)
+			RTWDOG->CS &= ~RTWDOG_CS_EN_MASK;
+	}
 
 	WDOG1->WCR &= ~WDOG_WCR_WDE_MASK;
 	WDOG2->WCR &= ~WDOG_WCR_WDE_MASK;
+	firert_refresh_watchdogs();
 	return STATUS_SUCCESS;
 }
 
@@ -290,6 +331,18 @@ static void firert_enable_redundant_clocks(void)
 	CCM->CCR = (CCM->CCR & ~CCM_CCR_OSCNT_MASK) | CCM_CCR_OSCNT(127);
 }
 
+static status_t firert_enable_rt1021_clocks(void)
+{
+	firert_enable_redundant_clocks();
+
+	CCM->CSCMR1 = (CCM->CSCMR1 & ~(CCM_CSCMR1_FLEXSPI_PODF_MASK |
+			CCM_CSCMR1_FLEXSPI_CLK_SEL_MASK)) |
+			CCM_CSCMR1_FLEXSPI_PODF(1u) |
+			CCM_CSCMR1_FLEXSPI_CLK_SEL(0u);
+
+	return STATUS_SUCCESS;
+}
+
 static void firert_pinmux_one(uint32_t mux, uint32_t daisy, uint32_t sel, uint32_t pad)
 {
 	*(volatile uint32_t *)mux = sel;
@@ -301,13 +354,23 @@ static void firert_pinmux_one(uint32_t mux, uint32_t daisy, uint32_t sel, uint32
 static void firert_config_pins(void)
 {
 	XTALOSC24M->OSC_CONFIG2 |= XTALOSC24M_OSC_CONFIG2_ENABLE_1M_MASK;
-	firert_pinmux_one(0x401f81e8u, 0x401f84a4u, 1u, 0x401f83d8u);
-	firert_pinmux_one(0x401f81ecu, 0x00000000u, 1u, 0x401f83dcu);
-	firert_pinmux_one(0x401f81f0u, 0x401f84c8u, 1u, 0x401f83e0u);
-	firert_pinmux_one(0x401f81f4u, 0x401f84a8u, 1u, 0x401f83e4u);
-	firert_pinmux_one(0x401f81f8u, 0x401f84acu, 1u, 0x401f83e8u);
-	firert_pinmux_one(0x401f81fcu, 0x401f84b0u, 1u, 0x401f83ecu);
-	firert_pinmux_one(0x401f8200u, 0x401f84b4u, 1u, 0x401f83f0u);
+	if (firert_soc == FIRET_SOC_IMXRT1021) {
+		firert_pinmux_one(0x401f816cu, 0x00000000u, 0x11u, 0x401f82e0u);
+		firert_pinmux_one(0x401f8170u, 0x401f8374u, 0x11u, 0x401f82e4u);
+		firert_pinmux_one(0x401f8174u, 0x401f8378u, 0x11u, 0x401f82e8u);
+		firert_pinmux_one(0x401f8178u, 0x401f8368u, 0x11u, 0x401f82ecu);
+		firert_pinmux_one(0x401f817cu, 0x401f8370u, 0x11u, 0x401f82f0u);
+		firert_pinmux_one(0x401f8180u, 0x401f836cu, 0x11u, 0x401f82f4u);
+		firert_pinmux_one(0x401f8184u, 0x00000000u, 0x11u, 0x401f82f8u);
+	} else {
+		firert_pinmux_one(0x401f81e8u, 0x401f84a4u, 1u, 0x401f83d8u);
+		firert_pinmux_one(0x401f81ecu, 0x00000000u, 1u, 0x401f83dcu);
+		firert_pinmux_one(0x401f81f0u, 0x401f84c8u, 1u, 0x401f83e0u);
+		firert_pinmux_one(0x401f81f4u, 0x401f84a8u, 1u, 0x401f83e4u);
+		firert_pinmux_one(0x401f81f8u, 0x401f84acu, 1u, 0x401f83e8u);
+		firert_pinmux_one(0x401f81fcu, 0x401f84b0u, 1u, 0x401f83ecu);
+		firert_pinmux_one(0x401f8200u, 0x401f84b4u, 1u, 0x401f83f0u);
+	}
 }
 
 static status_t firert_set_flash_config(void)
@@ -392,7 +455,8 @@ static status_t firert_init_flexspi(void)
 	if (st != STATUS_SUCCESS)
 		return st;
 	firert_stage(FIRET_BOOT_FLEXSPI_LUT);
-	st = firert_update_lut(0, firert_lut, sizeof(firert_lut) / sizeof(firert_lut[0]));
+	st = firert_update_lut(0, firert_active_lut(),
+			sizeof(firert_lut) / sizeof(firert_lut[0]));
 	if (st != STATUS_SUCCESS)
 		return st;
 	firert_stage(FIRET_BOOT_FLEXSPI_RESET1);
@@ -404,15 +468,16 @@ static status_t firert_wren(void)
 	return firert_ip_cmd(0, LUT_SEQ_WRITEENABLE);
 }
 
-static status_t firert_wait_ready(void)
+static status_t firert_wait_ready(uint32_t max_loops)
 {
 	uint32_t sr = 0u;
-	for (uint32_t loops = 0; loops < FIRET_WAIT_LOOPS; loops++) {
+	for (uint32_t loops = 0; loops < max_loops; loops++) {
 		status_t st = firert_ip_read(0, LUT_SEQ_READSTATUS, &sr, 1);
 		if (st != STATUS_SUCCESS)
 			return st;
 		if ((sr & 0x01u) == 0u)
 			return STATUS_SUCCESS;
+		firert_refresh_watchdogs();
 	}
 	return STATUS_FAIL;
 }
@@ -432,7 +497,9 @@ static status_t firert_erase_once(uint32_t addr, uint32_t kind)
 	status_t st;
 	uint8_t seq;
 
-	st = firert_wait_ready();
+	firert_refresh_watchdogs();
+
+	st = firert_wait_ready(FIRET_WAIT_LOOPS);
 	if (st != STATUS_SUCCESS)
 		return st;
 
@@ -449,7 +516,8 @@ static status_t firert_erase_once(uint32_t addr, uint32_t kind)
 	if (st != STATUS_SUCCESS)
 		return st;
 
-	st = firert_wait_ready();
+	st = firert_wait_ready((kind == FIRET_ERASE_CHIP) ?
+		FIRET_CHIP_ERASE_WAIT_LOOPS : FIRET_WAIT_LOOPS);
 	if (firert_sw_reset() != STATUS_SUCCESS)
 		return STATUS_FAIL;
 	return st;
@@ -463,15 +531,25 @@ static status_t firert_program(uint32_t flash_off, const uint8_t *src, uint32_t 
 		uint32_t page_base = flash_off & ~(FIRET_PAGE_SIZE - 1u);
 		uint32_t page_off = flash_off & (FIRET_PAGE_SIZE - 1u);
 		uint32_t chunk = FIRET_PAGE_SIZE - page_off;
+		const uint32_t *program_data;
 		status_t st;
 
 		if (chunk > size)
 			chunk = size;
 
-		firert_memcpy(page, (const void *)(FIRET_FLASH_BASE + page_base), FIRET_PAGE_SIZE);
-		firert_memcpy(&page[page_off], src, chunk);
+		firert_refresh_watchdogs();
 
-		st = firert_wait_ready();
+		if (page_off == 0u && chunk == FIRET_PAGE_SIZE &&
+				(((uintptr_t)src & 3u) == 0u)) {
+			program_data = (const uint32_t *)(const void *)src;
+		} else {
+			firert_memcpy(page, (const void *)(FIRET_FLASH_BASE + page_base),
+				FIRET_PAGE_SIZE);
+			firert_memcpy(&page[page_off], src, chunk);
+			program_data = (const uint32_t *)(const void *)page;
+		}
+
+		st = firert_wait_ready(FIRET_WAIT_LOOPS);
 		if (st != STATUS_SUCCESS)
 			return st;
 
@@ -479,23 +557,20 @@ static status_t firert_program(uint32_t flash_off, const uint8_t *src, uint32_t 
 		if (st != STATUS_SUCCESS)
 			return st;
 
-		st = firert_ip_write(page_base, (const uint32_t *)(const void *)page, FIRET_PAGE_SIZE);
+		st = firert_ip_write(page_base, program_data, FIRET_PAGE_SIZE);
 		if (st != STATUS_SUCCESS)
 			return st;
 
-		st = firert_wait_ready();
+		st = firert_wait_ready(FIRET_WAIT_LOOPS);
 		if (st != STATUS_SUCCESS)
 			return st;
-
-		if (firert_sw_reset() != STATUS_SUCCESS)
-			return STATUS_FAIL;
 
 		src += chunk;
 		flash_off += chunk;
 		size -= chunk;
 	}
 
-	return STATUS_SUCCESS;
+	return firert_sw_reset();
 }
 
 static void firert_handle_command(void)
@@ -524,12 +599,17 @@ static void firert_handle_command(void)
 	MB->detail0 = (uint32_t)st;
 	MB->status = (st == STATUS_SUCCESS) ? FIRET_ST_DONE : FIRET_ST_ERROR;
 	MB->cmd = FIRET_CMD_NONE;
+	firert_refresh_watchdogs();
 }
 
 __attribute__((section(".text.stub_entry")))
-void stub_entry(void)
+void stub_entry(uint32_t soc)
 {
 	status_t st;
+
+	__asm volatile ("cpsid i");
+
+	firert_soc = soc;
 
 	MB->magic = FIRET_MB_MAGIC;
 	MB->cmd = FIRET_CMD_NONE;
@@ -551,7 +631,14 @@ void stub_entry(void)
 		goto boot_fail;
 
 	firert_stage(FIRET_BOOT_CLOCK);
-	firert_enable_redundant_clocks();
+	if (firert_soc == FIRET_SOC_IMXRT1021)
+		st = firert_enable_rt1021_clocks();
+	else {
+		firert_enable_redundant_clocks();
+		st = STATUS_SUCCESS;
+	}
+	if (st != STATUS_SUCCESS)
+		goto boot_fail;
 
 	firert_stage(FIRET_BOOT_PINS);
 	firert_config_pins();
@@ -563,7 +650,10 @@ void stub_entry(void)
 
 	firert_stage(FIRET_BOOT_JEDEC);
 	MB->result = firert_read_jedec();
-	MB->detail0 = (MB->result != 0u) ? STATUS_SUCCESS : STATUS_FAIL;
+	if (MB->result != 0u)
+		MB->detail0 = STATUS_SUCCESS;
+	else if (MB->detail0 == 0u)
+		MB->detail0 = STATUS_FAIL;
 	if (MB->result == 0u) {
 		st = STATUS_FAIL;
 		goto boot_fail;

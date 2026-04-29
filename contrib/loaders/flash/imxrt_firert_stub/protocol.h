@@ -6,6 +6,11 @@
 #define FIRET_MB_ADDR 0x20206000u
 #define FIRET_MB_MAGIC 0x46525431u
 
+enum firert_soc {
+	FIRET_SOC_IMXRT1052 = 0,
+	FIRET_SOC_IMXRT1021 = 1,
+};
+
 enum firert_mb_cmd {
 	FIRET_CMD_NONE = 0,
 	FIRET_CMD_JEDEC = 1,
