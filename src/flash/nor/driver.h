@@ -293,6 +293,7 @@ extern const struct flash_driver ra8d1_ospi_flash;
 extern const struct flash_driver ra6m5_flash;
 extern const struct flash_driver ra6m5_qspi_flash;
 extern const struct flash_driver renesas_rpchf_flash;
+extern const struct flash_driver s7g2_flash;
 extern const struct flash_driver rp2040_flash;
 extern const struct flash_driver rsl10_flash;
 extern const struct flash_driver sh_qspi_flash;
