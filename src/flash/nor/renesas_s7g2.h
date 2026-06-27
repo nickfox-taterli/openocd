@@ -60,20 +60,4 @@
 #define S7G2_FACI_CMD_FORCED_STOP   0xB3u
 #define S7G2_FACI_CMD_FINAL         0xD0u
 
-#define S7G2_LOADER_STACK_SIZE      256u
-
-struct s7g2_loader_work_area {
-	uint32_t program_unit;
-	uint8_t stack[S7G2_LOADER_STACK_SIZE];
-	struct flash_async_algorithm_circbuf {
-#ifdef OPENOCD_CONTRIB_LOADERS_FLASH_RENESAS_S7G2
-		uint8_t *wp;
-		uint8_t *rp;
-#else
-		uint32_t wp;
-		uint32_t rp;
-#endif
-	} fifo;
-};
-
 #endif /* OPENOCD_FLASH_NOR_RENESAS_S7G2_H */
